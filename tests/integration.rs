@@ -707,6 +707,302 @@ async fn test_tenant_cannot_drop_schema() {
     assert!(!resp.status().is_success(), "Should not allow DROP SCHEMA");
 }
 
+// Advanced SQL injection / bypass attempts
+
+#[actix_web::test]
+async fn test_subquery_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access public schema via subquery
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM users WHERE id IN (SELECT id FROM public.postgate_databases)",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block qualified name in subquery"
+    );
+}
+
+#[actix_web::test]
+async fn test_cte_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access via CTE (WITH clause)
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "WITH leaked AS (SELECT * FROM public.postgate_databases) SELECT * FROM leaked",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block qualified name in CTE");
+}
+
+#[actix_web::test]
+async fn test_join_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access via JOIN
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM users JOIN public.postgate_databases ON true",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block qualified name in JOIN");
+}
+
+#[actix_web::test]
+async fn test_union_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access via UNION
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT id, name FROM users UNION SELECT id::text, name FROM public.postgate_databases",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block qualified name in UNION");
+}
+
+#[actix_web::test]
+async fn test_insert_select_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to exfiltrate via INSERT...SELECT
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "INSERT INTO users (name) SELECT name FROM public.postgate_databases",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block qualified name in INSERT SELECT"
+    );
+}
+
+#[actix_web::test]
+async fn test_update_from_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access via UPDATE...FROM
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "UPDATE users SET name = p.name FROM public.postgate_databases p WHERE users.id = 1",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block qualified name in UPDATE FROM"
+    );
+}
+
+#[actix_web::test]
+async fn test_delete_using_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access via DELETE...USING
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "DELETE FROM users USING public.postgate_databases WHERE true",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block qualified name in DELETE USING"
+    );
+}
+
+#[actix_web::test]
+async fn test_exists_subquery_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to probe via EXISTS
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM public.postgate_databases)",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block qualified name in EXISTS");
+}
+
+#[actix_web::test]
+async fn test_lateral_join_with_qualified_name() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access via LATERAL JOIN
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM users, LATERAL (SELECT * FROM public.postgate_databases LIMIT 1) sub",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block qualified name in LATERAL");
+}
+
+#[actix_web::test]
+async fn test_pg_class_access() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access pg_class (list all tables)
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT relname FROM pg_class WHERE relkind = 'r'",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block pg_class access");
+}
+
+#[actix_web::test]
+async fn test_pg_proc_access() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to list functions via pg_proc
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT proname FROM pg_proc WHERE proname LIKE '%tenant%'",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block pg_proc access");
+}
+
+#[actix_web::test]
+async fn test_pg_roles_access() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to list roles
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT rolname FROM pg_roles",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block pg_roles access");
+}
+
+#[actix_web::test]
+async fn test_case_sensitivity_bypass() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to bypass with mixed case
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM PG_CLASS",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block PG_CLASS (case insensitive)"
+    );
+}
+
+#[actix_web::test]
+async fn test_quoted_identifier_bypass() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to bypass with quoted identifier
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM \"public\".\"postgate_databases\"",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "Should block quoted qualified names");
+}
+
+#[actix_web::test]
+async fn test_nested_subqueries() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try deeply nested subqueries
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM users WHERE id = (SELECT id FROM (SELECT id FROM (SELECT id FROM public.postgate_databases LIMIT 1) a) b)",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block qualified name in nested subqueries"
+    );
+}
+
 // Test dedicated backend mode (separate connection pool)
 #[actix_web::test]
 async fn test_dedicated_backend() {
