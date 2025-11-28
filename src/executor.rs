@@ -3,8 +3,13 @@ use serde_json::Value as JsonValue;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow, PgTypeInfo};
 use sqlx::{Column, Row, TypeInfo};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::config::DatabaseBackend;
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -31,29 +36,42 @@ pub struct QueryResponse {
     pub row_count: usize,
 }
 
-pub struct Executor {
-    pool: PgPool,
+/// Manages execution of queries across different database backends
+pub struct ExecutorPool {
+    /// Shared pool for schema-based multi-tenancy
+    shared_pool: PgPool,
+    /// Dedicated pools for premium users (lazy-loaded)
+    dedicated_pools: RwLock<HashMap<Uuid, Arc<PgPool>>>,
 }
 
-impl Executor {
+impl ExecutorPool {
     pub async fn new(connection_string: &str) -> Result<Self, ExecutorError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
+        let shared_pool = PgPoolOptions::new()
+            .max_connections(50)
             .connect(connection_string)
             .await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            shared_pool,
+            dedicated_pools: RwLock::new(HashMap::new()),
+        })
     }
 
     pub async fn execute(
         &self,
+        database_id: Uuid,
+        backend: &DatabaseBackend,
         request: &QueryRequest,
         max_rows: u32,
         timeout_seconds: u64,
     ) -> Result<QueryResponse, ExecutorError> {
         let timeout = Duration::from_secs(timeout_seconds);
 
-        let result = tokio::time::timeout(timeout, self.execute_query(request, max_rows)).await;
+        let result = tokio::time::timeout(
+            timeout,
+            self.execute_query(database_id, backend, request, max_rows),
+        )
+        .await;
 
         match result {
             Ok(inner) => inner,
@@ -63,16 +81,49 @@ impl Executor {
 
     async fn execute_query(
         &self,
+        database_id: Uuid,
+        backend: &DatabaseBackend,
         request: &QueryRequest,
         max_rows: u32,
     ) -> Result<QueryResponse, ExecutorError> {
-        let mut query = sqlx::query(&request.sql);
+        match backend {
+            DatabaseBackend::Schema { schema_name } => {
+                self.execute_with_schema(schema_name, request, max_rows)
+                    .await
+            }
+            DatabaseBackend::Dedicated { connection_string } => {
+                self.execute_dedicated(database_id, connection_string, request, max_rows)
+                    .await
+            }
+        }
+    }
 
+    async fn execute_with_schema(
+        &self,
+        schema_name: &str,
+        request: &QueryRequest,
+        max_rows: u32,
+    ) -> Result<QueryResponse, ExecutorError> {
+        // Use a transaction to set search_path, then execute the query
+        let safe_schema = schema_name.replace('"', "\"\"");
+
+        let mut tx = self.shared_pool.begin().await?;
+
+        // Set the search_path for this transaction
+        sqlx::query(&format!("SET LOCAL search_path TO \"{}\"", safe_schema))
+            .execute(&mut *tx)
+            .await?;
+
+        // Execute the user query
+        let mut query = sqlx::query(&request.sql);
         for param in &request.params {
             query = bind_json_value(query, param);
         }
 
-        let rows: Vec<PgRow> = query.fetch_all(&self.pool).await?;
+        let rows: Vec<PgRow> = query.fetch_all(&mut *tx).await?;
+
+        // Commit the transaction
+        tx.commit().await?;
 
         if rows.len() > max_rows as usize {
             return Err(ExecutorError::RowLimitExceeded(max_rows));
@@ -82,6 +133,69 @@ impl Executor {
         let rows = rows.into_iter().map(row_to_json).collect();
 
         Ok(QueryResponse { rows, row_count })
+    }
+
+    async fn execute_dedicated(
+        &self,
+        database_id: Uuid,
+        connection_string: &str,
+        request: &QueryRequest,
+        max_rows: u32,
+    ) -> Result<QueryResponse, ExecutorError> {
+        let pool = self
+            .get_or_create_dedicated_pool(database_id, connection_string)
+            .await?;
+
+        let mut query = sqlx::query(&request.sql);
+        for param in &request.params {
+            query = bind_json_value(query, param);
+        }
+
+        let rows: Vec<PgRow> = query.fetch_all(pool.as_ref()).await?;
+
+        if rows.len() > max_rows as usize {
+            return Err(ExecutorError::RowLimitExceeded(max_rows));
+        }
+
+        let row_count = rows.len();
+        let rows = rows.into_iter().map(row_to_json).collect();
+
+        Ok(QueryResponse { rows, row_count })
+    }
+
+    async fn get_or_create_dedicated_pool(
+        &self,
+        database_id: Uuid,
+        connection_string: &str,
+    ) -> Result<Arc<PgPool>, ExecutorError> {
+        // Check if pool exists
+        {
+            let pools = self.dedicated_pools.read().await;
+            if let Some(pool) = pools.get(&database_id) {
+                return Ok(pool.clone());
+            }
+        }
+
+        // Create new pool
+        let pool = Arc::new(
+            PgPoolOptions::new()
+                .max_connections(10)
+                .connect(connection_string)
+                .await?,
+        );
+
+        // Store pool
+        {
+            let mut pools = self.dedicated_pools.write().await;
+            pools.insert(database_id, pool.clone());
+        }
+
+        Ok(pool)
+    }
+
+    /// Get the shared pool (for store operations)
+    pub fn shared_pool(&self) -> &PgPool {
+        &self.shared_pool
     }
 }
 

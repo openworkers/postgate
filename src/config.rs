@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    pub tenants: HashMap<String, TenantConfig>,
+    pub database_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,10 +22,19 @@ impl Default for ServerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    Schema { schema_name: String },
+    Dedicated { connection_string: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TenantConfig {
-    pub connection_string: String,
-    #[serde(default)]
+pub struct DatabaseConfig {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub name: String,
+    pub backend: DatabaseBackend,
     pub rules: QueryRules,
 }
 

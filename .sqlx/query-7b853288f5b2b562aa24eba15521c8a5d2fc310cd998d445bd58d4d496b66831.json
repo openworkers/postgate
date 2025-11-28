@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, user_id, name, backend_type, schema_name, connection_string, rules\n            FROM postgate_databases\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "backend_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "schema_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "connection_string",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "rules",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "7b853288f5b2b562aa24eba15521c8a5d2fc310cd998d445bd58d4d496b66831"
+}

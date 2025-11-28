@@ -1,6 +1,7 @@
 use actix_web::{HttpResponse, ResponseError};
 use serde::Serialize;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::executor::ExecutorError;
 use crate::parser::ParseError;
@@ -13,8 +14,8 @@ pub enum PostgateError {
     #[error("Execution error: {0}")]
     Executor(#[from] ExecutorError),
 
-    #[error("Tenant not found: {0}")]
-    TenantNotFound(String),
+    #[error("Database not found: {0}")]
+    DatabaseNotFound(Uuid),
 
     #[error("Missing authorization header")]
     MissingAuth,
@@ -44,8 +45,8 @@ impl ResponseError for PostgateError {
                 actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "DATABASE_ERROR",
             ),
-            PostgateError::TenantNotFound(_) => {
-                (actix_web::http::StatusCode::NOT_FOUND, "TENANT_NOT_FOUND")
+            PostgateError::DatabaseNotFound(_) => {
+                (actix_web::http::StatusCode::NOT_FOUND, "DATABASE_NOT_FOUND")
             }
             PostgateError::MissingAuth | PostgateError::InvalidAuth => {
                 (actix_web::http::StatusCode::UNAUTHORIZED, "UNAUTHORIZED")

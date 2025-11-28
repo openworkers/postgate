@@ -1,59 +1,26 @@
 use actix_web::{App, HttpServer, web};
-use std::collections::HashMap;
 use std::env;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use postgate::config::{Config, QueryRules, ServerConfig, SqlOperation, TenantConfig};
-use postgate::server::{AppState, health_handler, query_handler};
+use postgate::config::{Config, ServerConfig};
+use postgate::executor::ExecutorPool;
+use postgate::server::{AppState, configure_routes};
+use postgate::store::Store;
 
 fn load_config() -> Config {
-    // For now, load a simple config from environment
-    // In production, this would be loaded from a file or external source
-
     let host = env::var("POSTGATE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("POSTGATE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let mut tenants = HashMap::new();
-
-    // Load default tenant from DATABASE_URL if present
-    if let Ok(database_url) = env::var("DATABASE_URL") {
-        let rules = QueryRules {
-            allowed_operations: [
-                SqlOperation::Select,
-                SqlOperation::Insert,
-                SqlOperation::Update,
-                SqlOperation::Delete,
-            ]
-            .into_iter()
-            .collect(),
-            allowed_tables: None,
-            denied_tables: Default::default(),
-            max_rows: env::var("POSTGATE_MAX_ROWS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000),
-            timeout_seconds: env::var("POSTGATE_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
-        };
-
-        tenants.insert(
-            "default".to_string(),
-            TenantConfig {
-                connection_string: database_url,
-                rules,
-            },
-        );
-    }
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
 
     Config {
         server: ServerConfig { host, port },
-        tenants,
+        database_url,
     }
 }
 
@@ -71,15 +38,29 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
 
     info!("Starting postgate server on {}", bind_addr);
-    info!("Loaded {} tenant(s)", config.tenants.len());
 
-    let state = web::Data::new(AppState::new(config));
+    // Create executor pool (shared connection pool)
+    let executor_pool = ExecutorPool::new(&config.database_url)
+        .await
+        .expect("Failed to create executor pool");
+
+    // Run migrations
+    info!("Running database migrations...");
+    sqlx::migrate!("./migrations")
+        .run(executor_pool.shared_pool())
+        .await
+        .expect("Failed to run migrations");
+    info!("Migrations completed");
+
+    // Create store (uses the shared pool)
+    let store = Store::new(executor_pool.shared_pool().clone());
+
+    let state = web::Data::new(AppState::new(config, executor_pool, store));
 
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
-            .route("/health", web::get().to(health_handler))
-            .route("/query", web::post().to(query_handler))
+            .configure(configure_routes)
     })
     .bind(&bind_addr)?
     .run()
