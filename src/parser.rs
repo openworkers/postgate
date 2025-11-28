@@ -25,6 +25,12 @@ pub enum ParseError {
     #[error("Table '{0}' is denied")]
     TableDenied(String),
 
+    #[error("Qualified table names are not allowed: '{0}'")]
+    QualifiedTableName(String),
+
+    #[error("System table access is not allowed: '{0}'")]
+    SystemTableAccess(String),
+
     #[error("Unsupported statement type")]
     UnsupportedStatement,
 }
@@ -51,14 +57,17 @@ pub fn parse_and_validate(sql: &str, rules: &QueryRules) -> Result<ParsedQuery, 
 
     let statement = statements.into_iter().next().unwrap();
     let operation = extract_operation(&statement)?;
-    let tables = extract_tables(&statement);
+
+    // Extract and validate table references (blocks qualified names, pg_*, etc.)
+    let table_refs = extract_table_refs(&statement);
+    let tables = validate_table_refs(&table_refs)?;
 
     // Validate operation
     if !rules.allowed_operations.is_empty() && !rules.allowed_operations.contains(&operation) {
         return Err(ParseError::OperationNotAllowed(operation));
     }
 
-    // Validate tables
+    // Validate tables against rules
     for table in &tables {
         let table_lower = table.to_lowercase();
 
@@ -92,22 +101,67 @@ fn extract_operation(statement: &Statement) -> Result<SqlOperation, ParseError> 
     }
 }
 
-fn extract_tables(statement: &Statement) -> HashSet<String> {
-    let mut tables = HashSet::new();
+/// Table reference with schema info
+#[derive(Debug)]
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+fn extract_table_refs(statement: &Statement) -> Vec<TableRef> {
+    let mut tables = Vec::new();
 
     let _ = visit_relations(statement, |relation| {
-        tables.insert(
-            relation
-                .0
-                .iter()
-                .map(|i| i.value.clone())
-                .collect::<Vec<_>>()
-                .join("."),
-        );
+        let parts: Vec<_> = relation.0.iter().map(|i| i.value.clone()).collect();
+
+        let table_ref = match parts.len() {
+            1 => TableRef {
+                schema: None,
+                name: parts[0].clone(),
+            },
+            2 => TableRef {
+                schema: Some(parts[0].clone()),
+                name: parts[1].clone(),
+            },
+            _ => TableRef {
+                schema: Some(parts[..parts.len() - 1].join(".")),
+                name: parts[parts.len() - 1].clone(),
+            },
+        };
+
+        tables.push(table_ref);
         std::ops::ControlFlow::<()>::Continue(())
     });
 
     tables
+}
+
+fn validate_table_refs(table_refs: &[TableRef]) -> Result<HashSet<String>, ParseError> {
+    let mut table_names = HashSet::new();
+
+    for table_ref in table_refs {
+        // Block qualified names (schema.table)
+        if let Some(schema) = &table_ref.schema {
+            let full_name = format!("{}.{}", schema, table_ref.name);
+            return Err(ParseError::QualifiedTableName(full_name));
+        }
+
+        let name_lower = table_ref.name.to_lowercase();
+
+        // Block system tables (pg_*)
+        if name_lower.starts_with("pg_") {
+            return Err(ParseError::SystemTableAccess(table_ref.name.clone()));
+        }
+
+        // Block information_schema access
+        if name_lower == "information_schema" {
+            return Err(ParseError::SystemTableAccess(table_ref.name.clone()));
+        }
+
+        table_names.insert(table_ref.name.clone());
+    }
+
+    Ok(table_names)
 }
 
 #[cfg(test)]
@@ -183,5 +237,47 @@ mod tests {
         let rules = default_rules();
         let result = parse_and_validate("SELECT 1; SELECT 2", &rules);
         assert!(matches!(result, Err(ParseError::MultipleStatements)));
+    }
+
+    #[test]
+    fn test_qualified_table_name_rejected() {
+        let rules = default_rules();
+        let result = parse_and_validate("SELECT * FROM public.users", &rules);
+        assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
+    }
+
+    #[test]
+    fn test_schema_qualified_rejected() {
+        let rules = default_rules();
+        let result = parse_and_validate("SELECT * FROM other_schema.secrets", &rules);
+        assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
+    }
+
+    #[test]
+    fn test_pg_catalog_rejected() {
+        let rules = default_rules();
+        let result = parse_and_validate("SELECT * FROM pg_catalog.pg_tables", &rules);
+        assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
+    }
+
+    #[test]
+    fn test_pg_tables_rejected() {
+        let rules = default_rules();
+        let result = parse_and_validate("SELECT * FROM pg_tables", &rules);
+        assert!(matches!(result, Err(ParseError::SystemTableAccess(_))));
+    }
+
+    #[test]
+    fn test_pg_namespace_rejected() {
+        let rules = default_rules();
+        let result = parse_and_validate("SELECT * FROM pg_namespace", &rules);
+        assert!(matches!(result, Err(ParseError::SystemTableAccess(_))));
+    }
+
+    #[test]
+    fn test_information_schema_rejected() {
+        let rules = default_rules();
+        let result = parse_and_validate("SELECT * FROM information_schema.tables", &rules);
+        assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
     }
 }

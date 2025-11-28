@@ -513,6 +513,200 @@ async fn test_tenant_cannot_access_postgate_databases_table() {
     assert!(!resp.status().is_success());
 }
 
+// Security tests - ensure tenant isolation
+
+#[actix_web::test]
+async fn test_tenant_cannot_access_other_schema_qualified() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to access public schema with qualified name
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM public.postgate_databases",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(
+        !resp.status().is_success(),
+        "Should not access public.postgate_databases"
+    );
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_list_schemas() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to list all schemas via information_schema (qualified name - should be blocked)
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT schema_name FROM information_schema.schemata",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    // Should fail at parse time - qualified table names are blocked
+    assert_eq!(
+        resp.status(),
+        400,
+        "Should block information_schema.schemata"
+    );
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["code"], "PARSE_ERROR");
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_list_all_tables() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to list all tables via information_schema (qualified name - should be blocked)
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT table_schema, table_name FROM information_schema.tables",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    // Should fail at parse time - qualified table names are blocked
+    assert_eq!(resp.status(), 400, "Should block information_schema.tables");
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["code"], "PARSE_ERROR");
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_use_pg_catalog() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to query pg_catalog.pg_namespace (qualified name - should be blocked)
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT nspname FROM pg_catalog.pg_namespace",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    // Should fail at parse time - qualified table names are blocked
+    assert_eq!(resp.status(), 400, "Should block pg_catalog.pg_namespace");
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["code"], "PARSE_ERROR");
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_access_pg_tables_directly() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to query pg_tables directly (system table - should be blocked)
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM pg_tables",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    // Should fail at parse time - pg_* tables are blocked
+    assert_eq!(resp.status(), 400, "Should block pg_tables");
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["code"], "PARSE_ERROR");
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_call_admin_function_qualified() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to call admin function with schema-qualified name
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM public.create_tenant_database($1::uuid, $2)",
+            "params": [Uuid::new_v4().to_string(), "hacked"]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(
+        !resp.status().is_success(),
+        "Should not call public.create_tenant_database"
+    );
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_set_search_path() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to change search_path via SQL
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SET search_path TO public",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    // Should fail - SET is not SELECT/INSERT/UPDATE/DELETE
+    assert!(!resp.status().is_success(), "Should not allow SET command");
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_create_schema() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to create a new schema
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "CREATE SCHEMA hacked_schema",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(
+        !resp.status().is_success(),
+        "Should not allow CREATE SCHEMA"
+    );
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_drop_schema() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to drop a schema
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "DROP SCHEMA public CASCADE",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(!resp.status().is_success(), "Should not allow DROP SCHEMA");
+}
+
 // Test dedicated backend mode (separate connection pool)
 #[actix_web::test]
 async fn test_dedicated_backend() {
