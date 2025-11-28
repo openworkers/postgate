@@ -512,3 +512,84 @@ async fn test_tenant_cannot_access_postgate_databases_table() {
     // Should fail - table is in public schema, not accessible from tenant schema
     assert!(!resp.status().is_success());
 }
+
+// Test dedicated backend mode (separate connection pool)
+#[actix_web::test]
+async fn test_dedicated_backend() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
+
+    let executor_pool = ExecutorPool::new(&database_url)
+        .await
+        .expect("Failed to create pool");
+
+    let store = Store::new(executor_pool.shared_pool().clone());
+
+    // Create a dedicated database entry (using the same connection string for test)
+    let user_id = Uuid::new_v4();
+    let dedicated_id = Uuid::new_v4();
+
+    let rules = QueryRules {
+        allowed_operations: [
+            SqlOperation::Select,
+            SqlOperation::Insert,
+            SqlOperation::Update,
+            SqlOperation::Delete,
+        ]
+        .into_iter()
+        .collect(),
+        allowed_tables: None,
+        denied_tables: HashSet::new(),
+        max_rows: 1000,
+        timeout_seconds: 30,
+    };
+
+    // Insert dedicated database entry
+    sqlx::query(
+        r#"INSERT INTO postgate_databases (id, user_id, name, backend_type, connection_string, rules)
+           VALUES ($1, $2, 'dedicated_test', 'dedicated', $3, $4)"#,
+    )
+    .bind(dedicated_id)
+    .bind(user_id)
+    .bind(&database_url) // Same DB but tests dedicated code path
+    .bind(serde_json::to_value(&rules).unwrap())
+    .execute(executor_pool.shared_pool())
+    .await
+    .expect("Failed to create dedicated database entry");
+
+    let config = Config {
+        server: ServerConfig::default(),
+        database_url: database_url.clone(),
+        jwt_secret: TEST_JWT_SECRET.to_string(),
+    };
+
+    let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
+
+    let app = test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .configure(configure_routes),
+    )
+    .await;
+
+    let token = create_jwt(&dedicated_id);
+
+    // Query should work - dedicated mode doesn't use search_path, queries public schema directly
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", token)))
+        .set_json(json!({"sql": "SELECT COUNT(*) as cnt FROM postgate_databases", "params": []}))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    let status = resp.status();
+    let body: serde_json::Value = test::read_body_json(resp).await;
+
+    if !status.is_success() {
+        panic!("Dedicated query failed: {} - {:?}", status, body);
+    }
+
+    assert_eq!(body["row_count"], 1);
+    // Should have at least 1 row (the dedicated entry we just created)
+    assert!(body["rows"][0]["cnt"].as_i64().unwrap() >= 1);
+}
