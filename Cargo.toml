@@ -2,5 +2,40 @@
 name = "postgate"
 version = "0.1.0"
 edition = "2024"
+description = "Secure HTTP proxy for PostgreSQL with SQL validation and multi-tenant support"
+license = "MIT"
+repository = "https://github.com/openworkers/postgate"
+keywords = ["postgresql", "proxy", "http", "sql", "serverless"]
+categories = ["database", "web-programming"]
 
 [dependencies]
+# Web server
+actix-web = "4"
+actix-rt = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# PostgreSQL
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
+uuid = { version = "1", features = ["serde"] }
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# SQL parsing
+sqlparser = { version = "0.53", features = ["visitor"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config
+dotenvy = "0.15"

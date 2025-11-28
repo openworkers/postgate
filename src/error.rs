@@ -1,0 +1,60 @@
+use actix_web::{HttpResponse, ResponseError};
+use serde::Serialize;
+use thiserror::Error;
+
+use crate::executor::ExecutorError;
+use crate::parser::ParseError;
+
+#[derive(Debug, Error)]
+pub enum PostgateError {
+    #[error("Parse error: {0}")]
+    Parse(#[from] ParseError),
+
+    #[error("Execution error: {0}")]
+    Executor(#[from] ExecutorError),
+
+    #[error("Tenant not found: {0}")]
+    TenantNotFound(String),
+
+    #[error("Missing authorization header")]
+    MissingAuth,
+
+    #[error("Invalid authorization header")]
+    InvalidAuth,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+    code: &'static str,
+}
+
+impl ResponseError for PostgateError {
+    fn error_response(&self) -> HttpResponse {
+        let (status, code) = match self {
+            PostgateError::Parse(_) => (actix_web::http::StatusCode::BAD_REQUEST, "PARSE_ERROR"),
+            PostgateError::Executor(ExecutorError::Timeout) => {
+                (actix_web::http::StatusCode::GATEWAY_TIMEOUT, "TIMEOUT")
+            }
+            PostgateError::Executor(ExecutorError::RowLimitExceeded(_)) => (
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "ROW_LIMIT_EXCEEDED",
+            ),
+            PostgateError::Executor(_) => (
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "DATABASE_ERROR",
+            ),
+            PostgateError::TenantNotFound(_) => {
+                (actix_web::http::StatusCode::NOT_FOUND, "TENANT_NOT_FOUND")
+            }
+            PostgateError::MissingAuth | PostgateError::InvalidAuth => {
+                (actix_web::http::StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
+            }
+        };
+
+        HttpResponse::build(status).json(ErrorResponse {
+            error: self.to_string(),
+            code,
+        })
+    }
+}
