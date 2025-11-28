@@ -310,3 +310,205 @@ async fn test_query_expired_token() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 401);
 }
+
+// Helper to setup an admin app (with access to public schema)
+async fn setup_admin_app() -> (
+    impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    String, // Admin JWT token
+) {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
+
+    let executor_pool = ExecutorPool::new(&database_url)
+        .await
+        .expect("Failed to create pool");
+
+    // Run migrations to ensure functions exist (ignore errors if already run)
+    let _ = sqlx::migrate!("./migrations")
+        .run(executor_pool.shared_pool())
+        .await;
+
+    let store = Store::new(executor_pool.shared_pool().clone());
+
+    // Create admin database entry with access to public schema
+    let admin_id = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
+    let admin_user_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+
+    // Delete if exists (from previous test runs)
+    let _ = sqlx::query("DELETE FROM postgate_databases WHERE id = $1")
+        .bind(admin_id)
+        .execute(executor_pool.shared_pool())
+        .await;
+
+    let rules = QueryRules {
+        allowed_operations: [
+            SqlOperation::Select,
+            SqlOperation::Insert,
+            SqlOperation::Update,
+            SqlOperation::Delete,
+        ]
+        .into_iter()
+        .collect(),
+        allowed_tables: None,
+        denied_tables: HashSet::new(),
+        max_rows: 1000,
+        timeout_seconds: 30,
+    };
+
+    // Insert admin database with public schema access
+    sqlx::query(
+        r#"INSERT INTO postgate_databases (id, user_id, name, backend_type, schema_name, rules)
+           VALUES ($1, $2, 'admin', 'schema', 'public', $3)
+           ON CONFLICT (id) DO NOTHING"#,
+    )
+    .bind(admin_id)
+    .bind(admin_user_id)
+    .bind(serde_json::to_value(&rules).unwrap())
+    .execute(executor_pool.shared_pool())
+    .await
+    .expect("Failed to create admin database");
+
+    let config = Config {
+        server: ServerConfig::default(),
+        database_url,
+        jwt_secret: TEST_JWT_SECRET.to_string(),
+    };
+
+    let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
+
+    let app = test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .configure(configure_routes),
+    )
+    .await;
+
+    let token = create_jwt(&admin_id);
+    (app, token)
+}
+
+#[actix_web::test]
+async fn test_admin_can_create_tenant() {
+    let (app, admin_token) = setup_admin_app().await;
+
+    let user_id = Uuid::new_v4();
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM create_tenant_database($1::uuid, $2)",
+            "params": [user_id.to_string(), "test_db"]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    let status = resp.status();
+    let body: serde_json::Value = test::read_body_json(resp).await;
+
+    if !status.is_success() {
+        panic!("Admin create tenant failed: {} - {:?}", status, body);
+    }
+
+    assert_eq!(body["row_count"], 1);
+    assert!(body["rows"][0]["id"].is_string());
+    assert!(body["rows"][0]["schema_name"].is_string());
+}
+
+#[actix_web::test]
+async fn test_admin_can_list_tenants() {
+    let (app, admin_token) = setup_admin_app().await;
+
+    let user_id = Uuid::new_v4();
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM list_tenant_databases($1::uuid)",
+            "params": [user_id.to_string()]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+}
+
+#[actix_web::test]
+async fn test_admin_can_delete_tenant() {
+    let (app, admin_token) = setup_admin_app().await;
+
+    // First create a tenant
+    let user_id = Uuid::new_v4();
+    let create_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM create_tenant_database($1::uuid, $2)",
+            "params": [user_id.to_string(), "to_delete"]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, create_req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let tenant_id = body["rows"][0]["id"].as_str().unwrap();
+
+    // Now delete it
+    let delete_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT delete_tenant_database($1::uuid)",
+            "params": [tenant_id]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, delete_req).await;
+    assert!(resp.status().is_success());
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["rows"][0]["delete_tenant_database"], true);
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_call_admin_functions() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to call create_tenant_database from a regular tenant
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM create_tenant_database($1, $2)",
+            "params": [Uuid::new_v4().to_string(), "hacked_db"]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+
+    // Should fail because the function is in public schema,
+    // but tenant's search_path is their own schema
+    assert!(!resp.status().is_success());
+}
+
+#[actix_web::test]
+async fn test_tenant_cannot_access_postgate_databases_table() {
+    let (app, tenant_token) = setup_test_app().await;
+
+    // Try to directly query postgate_databases
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM postgate_databases",
+            "params": []
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+
+    // Should fail - table is in public schema, not accessible from tenant schema
+    assert!(!resp.status().is_success());
+}
