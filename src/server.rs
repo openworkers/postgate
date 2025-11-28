@@ -1,6 +1,7 @@
 use actix_web::{HttpRequest, HttpResponse, web};
 use uuid::Uuid;
 
+use crate::auth::{JwtValidator, extract_database_id};
 use crate::config::Config;
 use crate::error::PostgateError;
 use crate::executor::{ExecutorPool, QueryRequest, QueryResponse};
@@ -11,31 +12,31 @@ pub struct AppState {
     pub config: Config,
     pub executor_pool: ExecutorPool,
     pub store: Store,
+    pub jwt_validator: JwtValidator,
 }
 
 impl AppState {
     pub fn new(config: Config, executor_pool: ExecutorPool, store: Store) -> Self {
+        let jwt_validator = JwtValidator::new(&config.jwt_secret);
         Self {
             config,
             executor_pool,
             store,
+            jwt_validator,
         }
     }
 }
 
-fn extract_database_id(req: &HttpRequest) -> Result<Uuid, PostgateError> {
+fn get_database_id(req: &HttpRequest, state: &AppState) -> Result<Uuid, PostgateError> {
     let auth_header = req
         .headers()
         .get("Authorization")
-        .ok_or(PostgateError::MissingAuth)?
-        .to_str()
-        .map_err(|_| PostgateError::InvalidAuth)?;
+        .and_then(|h| h.to_str().ok());
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or(PostgateError::InvalidAuth)?;
-
-    Uuid::parse_str(token).map_err(|_| PostgateError::InvalidAuth)
+    extract_database_id(auth_header, &state.jwt_validator).map_err(|e| match e {
+        crate::auth::AuthError::MissingHeader => PostgateError::MissingAuth,
+        _ => PostgateError::InvalidAuth,
+    })
 }
 
 pub async fn query_handler(
@@ -43,7 +44,7 @@ pub async fn query_handler(
     state: web::Data<AppState>,
     body: web::Json<QueryRequest>,
 ) -> Result<HttpResponse, PostgateError> {
-    let database_id = extract_database_id(&req)?;
+    let database_id = get_database_id(&req, &state)?;
 
     // Load database config from store
     let db_config = state

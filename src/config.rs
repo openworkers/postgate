@@ -5,6 +5,7 @@ use std::collections::HashSet;
 pub struct Config {
     pub server: ServerConfig,
     pub database_url: String,
+    pub jwt_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

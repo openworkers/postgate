@@ -18,9 +18,12 @@ fn load_config() -> Config {
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
 
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET environment variable is required");
+
     Config {
         server: ServerConfig { host, port },
         database_url,
+        jwt_secret,
     }
 }
 

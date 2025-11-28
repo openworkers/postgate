@@ -1,4 +1,6 @@
 use actix_web::test;
+use jsonwebtoken::{EncodingKey, Header, encode};
+use postgate::auth::Claims;
 use postgate::config::{Config, DatabaseBackend, QueryRules, ServerConfig, SqlOperation};
 use postgate::executor::ExecutorPool;
 use postgate::server::{AppState, configure_routes};
@@ -7,13 +9,29 @@ use serde_json::json;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+const TEST_JWT_SECRET: &str = "test_secret_for_integration_tests";
+
+fn create_jwt(database_id: &Uuid) -> String {
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+    let claims = Claims {
+        sub: database_id.to_string(),
+        exp,
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
 async fn setup_test_app() -> (
     impl actix_web::dev::Service<
         actix_http::Request,
         Response = actix_web::dev::ServiceResponse,
         Error = actix_web::Error,
     >,
-    Uuid,
+    String, // JWT token instead of Uuid
 ) {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
@@ -77,6 +95,7 @@ async fn setup_test_app() -> (
     let config = Config {
         server: ServerConfig::default(),
         database_url,
+        jwt_secret: TEST_JWT_SECRET.to_string(),
     };
 
     let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
@@ -88,7 +107,8 @@ async fn setup_test_app() -> (
     )
     .await;
 
-    (app, db_config.id)
+    let token = create_jwt(&db_config.id);
+    (app, token)
 }
 
 #[actix_web::test]
@@ -105,6 +125,7 @@ async fn test_health_endpoint() {
     let config = Config {
         server: ServerConfig::default(),
         database_url,
+        jwt_secret: TEST_JWT_SECRET.to_string(),
     };
 
     let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
@@ -127,7 +148,7 @@ async fn test_health_endpoint() {
 
 #[actix_web::test]
 async fn test_query_missing_auth() {
-    let (app, _db_id) = setup_test_app().await;
+    let (app, _token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
@@ -142,12 +163,12 @@ async fn test_query_missing_auth() {
 }
 
 #[actix_web::test]
-async fn test_query_invalid_uuid() {
-    let (app, _db_id) = setup_test_app().await;
+async fn test_query_invalid_token() {
+    let (app, _token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", "Bearer not-a-uuid"))
+        .insert_header(("Authorization", "Bearer invalid-jwt-token"))
         .set_json(json!({"sql": "SELECT 1", "params": []}))
         .to_request();
 
@@ -157,12 +178,15 @@ async fn test_query_invalid_uuid() {
 
 #[actix_web::test]
 async fn test_query_unknown_database() {
-    let (app, _db_id) = setup_test_app().await;
+    let (app, _token) = setup_test_app().await;
 
+    // Create a valid JWT but for a non-existent database
     let fake_id = Uuid::new_v4();
+    let fake_token = create_jwt(&fake_id);
+
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", fake_id)))
+        .insert_header(("Authorization", format!("Bearer {}", fake_token)))
         .set_json(json!({"sql": "SELECT 1", "params": []}))
         .to_request();
 
@@ -175,11 +199,11 @@ async fn test_query_unknown_database() {
 
 #[actix_web::test]
 async fn test_query_select() {
-    let (app, db_id) = setup_test_app().await;
+    let (app, token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", db_id)))
+        .insert_header(("Authorization", format!("Bearer {}", token)))
         .set_json(json!({"sql": "SELECT * FROM users", "params": []}))
         .to_request();
 
@@ -193,11 +217,11 @@ async fn test_query_select() {
 
 #[actix_web::test]
 async fn test_query_with_params() {
-    let (app, db_id) = setup_test_app().await;
+    let (app, token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", db_id)))
+        .insert_header(("Authorization", format!("Bearer {}", token)))
         .set_json(json!({"sql": "SELECT * FROM users WHERE name = $1", "params": ["Alice"]}))
         .to_request();
 
@@ -210,11 +234,11 @@ async fn test_query_with_params() {
 
 #[actix_web::test]
 async fn test_query_insert() {
-    let (app, db_id) = setup_test_app().await;
+    let (app, token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", db_id)))
+        .insert_header(("Authorization", format!("Bearer {}", token)))
         .set_json(json!({"sql": "INSERT INTO users (name) VALUES ($1) RETURNING *", "params": ["Charlie"]}))
         .to_request();
 
@@ -227,11 +251,11 @@ async fn test_query_insert() {
 
 #[actix_web::test]
 async fn test_query_invalid_sql() {
-    let (app, db_id) = setup_test_app().await;
+    let (app, token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", db_id)))
+        .insert_header(("Authorization", format!("Bearer {}", token)))
         .set_json(json!({"sql": "SELEKT * FORM users", "params": []}))
         .to_request();
 
@@ -244,11 +268,11 @@ async fn test_query_invalid_sql() {
 
 #[actix_web::test]
 async fn test_query_multiple_statements_rejected() {
-    let (app, db_id) = setup_test_app().await;
+    let (app, token) = setup_test_app().await;
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", db_id)))
+        .insert_header(("Authorization", format!("Bearer {}", token)))
         .set_json(json!({"sql": "SELECT 1; SELECT 2", "params": []}))
         .to_request();
 
@@ -257,4 +281,32 @@ async fn test_query_multiple_statements_rejected() {
 
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(body["code"], "PARSE_ERROR");
+}
+
+#[actix_web::test]
+async fn test_query_expired_token() {
+    let (app, _token) = setup_test_app().await;
+
+    // Create an expired JWT
+    let db_id = Uuid::new_v4();
+    let exp = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize;
+    let claims = Claims {
+        sub: db_id.to_string(),
+        exp,
+    };
+    let expired_token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .unwrap();
+
+    let req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", expired_token)))
+        .set_json(json!({"sql": "SELECT 1", "params": []}))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401);
 }
