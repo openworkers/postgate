@@ -240,7 +240,20 @@ fn bind_json_value<'q>(
             }
         }
         JsonValue::String(s) => query.bind(s.as_str()),
-        JsonValue::Array(_) | JsonValue::Object(_) => query.bind(value),
+        JsonValue::Array(arr) => {
+            // Check if it's an array of strings - bind as text[]
+            if arr.iter().all(|v| v.is_string()) {
+                let strings: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                query.bind(strings)
+            } else {
+                // Mixed array - bind as JSONB
+                query.bind(value)
+            }
+        }
+        JsonValue::Object(_) => query.bind(value),
     }
 }
 

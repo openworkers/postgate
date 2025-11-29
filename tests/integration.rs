@@ -533,110 +533,98 @@ async fn test_pg_class_access() {
     assert_eq!(resp.status(), 400, "Should block pg_class access");
 }
 
-// Test token management endpoints
+// Test token management via SQL (using PL/pgSQL functions)
 
 #[actix_web::test]
-async fn test_create_token_endpoint() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
+async fn test_create_token_via_sql() {
+    let (app, admin_token) = setup_admin_app().await;
 
-    let executor_pool = ExecutorPool::new(&database_url)
-        .await
-        .expect("Failed to create pool");
-
-    let _ = sqlx::migrate!("./migrations")
-        .run(executor_pool.shared_pool())
-        .await;
-
-    let store = Store::new(executor_pool.shared_pool().clone());
-
-    // Setup admin database (ID = 00000000-0000-0000-0000-000000000000)
-    let admin_id = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
-
-    // Clean up and create admin database
-    let _ = sqlx::query("DELETE FROM postgate_tokens WHERE database_id = $1")
-        .bind(admin_id)
-        .execute(executor_pool.shared_pool())
-        .await;
-    let _ = sqlx::query("DELETE FROM postgate_databases WHERE id = $1")
-        .bind(admin_id)
-        .execute(executor_pool.shared_pool())
-        .await;
-
-    sqlx::query(
-        r#"INSERT INTO postgate_databases (id, name, backend_type, schema_name, max_rows)
-           VALUES ($1, 'admin', 'schema', 'public', 1000)"#,
-    )
-    .bind(admin_id)
-    .execute(executor_pool.shared_pool())
-    .await
-    .expect("Failed to create admin database");
-
-    // Create admin token
-    let (_, admin_token) = store
-        .create_token(admin_id, "admin_token", TokenPermission::default_set())
-        .await
-        .expect("Failed to create admin token");
-
-    // Create a target database to create token for
-    let db_config = store
-        .create_database(
-            "token_test_db",
-            &DatabaseBackend::Schema {
-                schema_name: generate_schema_name("token_test"),
-            },
-            1000, // max_rows
-        )
-        .await
-        .expect("Failed to create database");
-
-    let config = Config {
-        server: ServerConfig::default(),
-        database_url,
-    };
-
-    let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
-
-    let app = test::init_service(
-        actix_web::App::new()
-            .app_data(state)
-            .configure(configure_routes),
-    )
-    .await;
-
-    // Create a token via the endpoint (requires admin auth)
-    let req = test::TestRequest::post()
-        .uri("/tokens")
+    // First create a tenant database
+    let db_name = format!("token_test_{}", &Uuid::new_v4().to_string()[..8]);
+    let create_db_req = test::TestRequest::post()
+        .uri("/query")
         .insert_header(("Authorization", format!("Bearer {}", admin_token)))
         .set_json(json!({
-            "database_id": db_config.id.to_string(),
-            "name": "my_token"
+            "sql": "SELECT * FROM create_tenant_database($1)",
+            "params": [db_name]
         }))
         .to_request();
 
-    let resp = test::call_service(&app, req).await;
+    let resp = test::call_service(&app, create_db_req).await;
     assert!(resp.status().is_success());
 
     let body: serde_json::Value = test::read_body_json(resp).await;
-    assert!(body["id"].is_string());
-    assert!(body["token"].as_str().unwrap().starts_with("pg_"));
-    assert!(body["message"].as_str().is_some());
-}
+    let database_id = body["rows"][0]["id"].as_str().unwrap();
 
-#[actix_web::test]
-async fn test_create_token_requires_admin() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to create a token with a non-admin token - should fail
-    let req = test::TestRequest::post()
-        .uri("/tokens")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+    // Create a token via SQL function
+    let create_token_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
         .set_json(json!({
-            "database_id": "00000000-0000-0000-0000-000000000000",
-            "name": "hacked_token"
+            "sql": "SELECT * FROM create_tenant_token($1::uuid, $2, $3::text[])",
+            "params": [database_id, "my_token", ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"]]
         }))
         .to_request();
 
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 403, "Non-admin should get 403 Forbidden");
+    let resp = test::call_service(&app, create_token_req).await;
+    assert!(resp.status().is_success());
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["rows"][0]["id"].is_string());
+    assert!(
+        body["rows"][0]["token"]
+            .as_str()
+            .unwrap()
+            .starts_with("pg_")
+    );
+}
+
+#[actix_web::test]
+async fn test_delete_token_via_sql() {
+    let (app, admin_token) = setup_admin_app().await;
+
+    // Create a tenant database
+    let db_name = format!("delete_token_test_{}", &Uuid::new_v4().to_string()[..8]);
+    let create_db_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM create_tenant_database($1)",
+            "params": [db_name]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, create_db_req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let database_id = body["rows"][0]["id"].as_str().unwrap();
+
+    // Create a token
+    let create_token_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT * FROM create_tenant_token($1::uuid)",
+            "params": [database_id]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, create_token_req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let token_id = body["rows"][0]["id"].as_str().unwrap();
+
+    // Delete the token
+    let delete_token_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "sql": "SELECT delete_tenant_token($1::uuid)",
+            "params": [token_id]
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, delete_token_req).await;
+    assert!(resp.status().is_success());
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["rows"][0]["delete_tenant_token"], true);
 }
