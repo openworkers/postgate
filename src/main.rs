@@ -1,4 +1,5 @@
 use actix_web::{App, HttpServer, web};
+use clap::{Parser, Subcommand};
 use std::env;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -9,6 +10,32 @@ use postgate::executor::ExecutorPool;
 use postgate::server::{AppState, configure_routes};
 use postgate::store::Store;
 use postgate::token::generate_token;
+
+/// Secure HTTP proxy for PostgreSQL with SQL validation and multi-tenant support
+#[derive(Parser)]
+#[command(name = "postgate")]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Generate a token for a database
+    GenToken {
+        /// Database UUID
+        database_id: String,
+
+        /// Token name
+        #[arg(default_value = "default")]
+        name: String,
+
+        /// Comma-separated permissions: SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP
+        #[arg(short, long, default_value = "SELECT,INSERT,UPDATE,DELETE")]
+        permissions: String,
+    },
+}
 
 fn load_config() -> Config {
     let host = env::var("POSTGATE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -29,6 +56,7 @@ fn load_config() -> Config {
 async fn generate_token_command(
     database_id: &str,
     name: &str,
+    permissions_str: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
@@ -43,14 +71,28 @@ async fn generate_token_command(
     // Generate token
     let (token, token_hash, token_prefix) = generate_token();
 
+    // Parse permissions
+    let permissions: Vec<&str> = permissions_str.split(',').map(|s| s.trim()).collect();
+
+    // Validate permissions
+    let valid_ops = [
+        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP",
+    ];
+    for perm in &permissions {
+        if !valid_ops.contains(perm) {
+            return Err(format!("Invalid permission: {}. Valid: {:?}", perm, valid_ops).into());
+        }
+    }
+
     // Insert into database
     sqlx::query(
         r#"
-        INSERT INTO postgate_tokens (database_id, name, token_hash, token_prefix)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO postgate_tokens (database_id, name, token_hash, token_prefix, allowed_operations)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (database_id, name) DO UPDATE SET
             token_hash = EXCLUDED.token_hash,
             token_prefix = EXCLUDED.token_prefix,
+            allowed_operations = EXCLUDED.allowed_operations,
             created_at = NOW()
         "#,
     )
@@ -58,6 +100,7 @@ async fn generate_token_command(
     .bind(name)
     .bind(&token_hash)
     .bind(&token_prefix)
+    .bind(&permissions)
     .execute(&pool)
     .await?;
 
@@ -66,42 +109,30 @@ async fn generate_token_command(
     Ok(())
 }
 
-fn print_usage() {
-    eprintln!("Usage: postgate [OPTIONS]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --gen-token <database_id> [name]  Generate a token for a database");
-    eprintln!("                                    Default name is 'default'");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  postgate --gen-token 00000000-0000-0000-0000-000000000000");
-    eprintln!("  postgate --gen-token 00000000-0000-0000-0000-000000000000 admin");
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
 
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
 
-    // Handle --gen-token command
-    if args.len() >= 3 && args[1] == "--gen-token" {
-        let database_id = &args[2];
-        let name = args.get(3).map(|s| s.as_str()).unwrap_or("default");
-
-        if let Err(e) = generate_token_command(database_id, name).await {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+    // Handle subcommands
+    if let Some(command) = cli.command {
+        match command {
+            Commands::GenToken {
+                database_id,
+                name,
+                permissions,
+            } => {
+                if let Err(e) = generate_token_command(&database_id, &name, &permissions).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
         }
-        return Ok(());
     }
 
-    // Handle --help
-    if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
-        print_usage();
-        return Ok(());
-    }
-
+    // Start server
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env().add_directive("postgate=info".parse().unwrap()),

@@ -58,21 +58,28 @@ DATABASE_URL="postgres://postgate:your-password@localhost/postgate" cargo run
 
 ### 2. Create Admin Token
 
-The migration creates an admin database with UUID `00000000-0000-0000-0000-000000000000`.
-Create a token for it manually:
+Use the CLI to generate tokens for the seed databases:
+
+```bash
+# Generate token for postgate admin (manages tenants)
+DATABASE_URL="postgres://postgate:your-password@localhost/postgate" \
+  cargo run -- gen-token 00000000-0000-0000-0000-000000000000 postgate-admin
+# Output: pg_abc123... (SAVE THIS!)
+
+# Generate token for openworkers (dedicated database)
+DATABASE_URL="postgres://postgate:your-password@localhost/postgate" \
+  cargo run -- gen-token 00000000-0000-0000-0000-000000000001 openworkers
+# Output: pg_def456... (SAVE THIS!)
+```
+
+Or via SQL directly:
 
 ```sql
--- Connect directly to PostgreSQL
-psql postgate
-
--- Create admin token
 SELECT * FROM create_tenant_token(
     '00000000-0000-0000-0000-000000000000'::uuid,
     'admin',
     ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP']
 );
--- Returns: { id: "token-uuid", token: "pg_abc123..." }
--- SAVE THIS TOKEN! It's only shown once.
 ```
 
 ### 3. Use the API
@@ -101,6 +108,37 @@ curl -X POST http://localhost:3000/query \
 | `DATABASE_URL` | *required* | PostgreSQL connection string |
 | `POSTGATE_HOST` | `127.0.0.1` | HTTP server bind address |
 | `POSTGATE_PORT` | `3000` | HTTP server port |
+
+## CLI Commands
+
+```bash
+# Start the server (default)
+cargo run
+
+# Generate a token for a database
+cargo run -- gen-token <DATABASE_ID> [NAME] [-p <PERMISSIONS>]
+
+# Show help
+cargo run -- --help
+cargo run -- gen-token --help
+```
+
+**Examples:**
+
+```bash
+# Default DML permissions (SELECT, INSERT, UPDATE, DELETE)
+cargo run -- gen-token 00000000-0000-0000-0000-000000000000
+
+# Named token with default permissions
+cargo run -- gen-token 00000000-0000-0000-0000-000000000000 admin
+
+# Full permissions (DML + DDL)
+cargo run -- gen-token 00000000-0000-0000-0000-000000000000 admin \
+    -p SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP
+
+# Read-only token
+cargo run -- gen-token 00000000-0000-0000-0000-000000000000 readonly -p SELECT
+```
 
 ## API Reference
 

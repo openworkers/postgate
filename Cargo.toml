@@ -46,5 +46,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Config
 dotenvy = "0.15"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 [dev-dependencies]
 actix-http = "3"
