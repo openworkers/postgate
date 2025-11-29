@@ -2,6 +2,7 @@
 name = "postgate"
 version = "0.1.0"
 edition = "2024"
+default-run = "postgate"
 description = "Secure HTTP proxy for PostgreSQL with SQL validation and multi-tenant support"
 license = "MIT"
 repository = "https://github.com/openworkers/postgate"
@@ -33,8 +34,10 @@ serde_json = "1"
 # Error handling
 thiserror = "2"
 
-# JWT
-jsonwebtoken = "9"
+# Token hashing
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
 
 # Logging
 tracing = "0.1"

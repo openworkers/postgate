@@ -1,7 +1,14 @@
-use jsonwebtoken::{DecodingKey, Validation, decode};
-use serde::{Deserialize, Serialize};
+//! Token-based authentication for postgate
+//!
+//! Tokens are formatted as: pg_<random_64_hex_chars>
+//! They are validated by hashing and comparing with stored hash
+
+use std::collections::HashSet;
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::config::SqlOperation;
+use crate::token::{hash_token, is_valid_format};
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -11,138 +18,81 @@ pub enum AuthError {
     #[error("Invalid authorization header format")]
     InvalidFormat,
 
-    #[error("Invalid token: {0}")]
-    InvalidToken(#[from] jsonwebtoken::errors::Error),
+    #[error("Invalid token format")]
+    InvalidTokenFormat,
 
-    #[error("Invalid database_id in token")]
-    InvalidDatabaseId,
+    #[error("Invalid or expired token")]
+    InvalidToken,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Claims {
-    /// Subject - the database UUID
-    pub sub: String,
-    /// Expiration time (Unix timestamp)
-    pub exp: usize,
+/// Token info returned after validation
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub database_id: Uuid,
+    pub token_id: Uuid,
+    pub allowed_operations: HashSet<SqlOperation>,
 }
 
-pub struct JwtValidator {
-    decoding_key: DecodingKey,
-    validation: Validation,
-}
-
-impl JwtValidator {
-    pub fn new(secret: &str) -> Self {
-        Self {
-            decoding_key: DecodingKey::from_secret(secret.as_bytes()),
-            validation: Validation::default(),
-        }
-    }
-
-    pub fn validate(&self, token: &str) -> Result<Uuid, AuthError> {
-        let token_data = decode::<Claims>(token, &self.decoding_key, &self.validation)?;
-
-        Uuid::parse_str(&token_data.claims.sub).map_err(|_| AuthError::InvalidDatabaseId)
-    }
-}
-
-/// Extract and validate JWT from Authorization header
-pub fn extract_database_id(
-    auth_header: Option<&str>,
-    validator: &JwtValidator,
-) -> Result<Uuid, AuthError> {
+/// Extract token from Authorization header
+/// Supports both "Bearer <token>" and plain "<token>" formats
+pub fn extract_token(auth_header: Option<&str>) -> Result<String, AuthError> {
     let header = auth_header.ok_or(AuthError::MissingHeader)?;
 
-    let token = header
-        .strip_prefix("Bearer ")
-        .ok_or(AuthError::InvalidFormat)?;
+    // Support both "Bearer pg_xxx" and "pg_xxx" formats
+    let token = header.strip_prefix("Bearer ").unwrap_or(header).trim();
 
-    validator.validate(token)
+    if !is_valid_format(token) {
+        return Err(AuthError::InvalidTokenFormat);
+    }
+
+    Ok(token.to_string())
+}
+
+/// Compute the hash of a token for database lookup
+pub fn compute_token_hash(token: &str) -> String {
+    hash_token(token)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{EncodingKey, Header, encode};
-
-    fn create_test_token(secret: &str, database_id: &Uuid, exp: usize) -> String {
-        let claims = Claims {
-            sub: database_id.to_string(),
-            exp,
-        };
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        )
-        .unwrap()
-    }
+    use crate::token::generate_token;
 
     #[test]
-    fn test_valid_token() {
-        let secret = "test_secret";
-        let database_id = Uuid::new_v4();
-        let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
-
-        let token = create_test_token(secret, &database_id, exp);
-        let validator = JwtValidator::new(secret);
-
-        let result = validator.validate(&token);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), database_id);
-    }
-
-    #[test]
-    fn test_invalid_secret() {
-        let database_id = Uuid::new_v4();
-        let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
-
-        let token = create_test_token("secret1", &database_id, exp);
-        let validator = JwtValidator::new("secret2");
-
-        let result = validator.validate(&token);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_expired_token() {
-        let secret = "test_secret";
-        let database_id = Uuid::new_v4();
-        let exp = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize;
-
-        let token = create_test_token(secret, &database_id, exp);
-        let validator = JwtValidator::new(secret);
-
-        let result = validator.validate(&token);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_database_id() {
-        let secret = "test_secret";
-        let database_id = Uuid::new_v4();
-        let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
-
-        let token = create_test_token(secret, &database_id, exp);
-        let validator = JwtValidator::new(secret);
-
+    fn test_extract_token_bearer() {
+        let (token, _, _) = generate_token();
         let header = format!("Bearer {}", token);
-        let result = extract_database_id(Some(&header), &validator);
+
+        let result = extract_token(Some(&header));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), database_id);
+        assert_eq!(result.unwrap(), token);
     }
 
     #[test]
-    fn test_missing_header() {
-        let validator = JwtValidator::new("secret");
-        let result = extract_database_id(None, &validator);
+    fn test_extract_token_plain() {
+        let (token, _, _) = generate_token();
+
+        let result = extract_token(Some(&token));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), token);
+    }
+
+    #[test]
+    fn test_extract_token_missing() {
+        let result = extract_token(None);
         assert!(matches!(result, Err(AuthError::MissingHeader)));
     }
 
     #[test]
-    fn test_invalid_format() {
-        let validator = JwtValidator::new("secret");
-        let result = extract_database_id(Some("Basic xyz"), &validator);
-        assert!(matches!(result, Err(AuthError::InvalidFormat)));
+    fn test_extract_token_invalid_format() {
+        let result = extract_token(Some("Bearer invalid_token"));
+        assert!(matches!(result, Err(AuthError::InvalidTokenFormat)));
+    }
+
+    #[test]
+    fn test_compute_token_hash() {
+        let (token, expected_hash, _) = generate_token();
+        let computed_hash = compute_token_hash(&token);
+        assert_eq!(computed_hash, expected_hash);
     }
 }

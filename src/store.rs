@@ -1,8 +1,11 @@
 use sqlx::postgres::PgPool;
+use std::collections::HashSet;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::config::{DatabaseBackend, DatabaseConfig, QueryRules};
+use crate::auth::TokenInfo;
+use crate::config::{DatabaseBackend, DatabaseConfig, SqlOperation, TokenPermission};
+use crate::token::generate_token;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -14,6 +17,9 @@ pub enum StoreError {
 
     #[error("Invalid backend type: {0}")]
     InvalidBackendType(String),
+
+    #[error("Token not found")]
+    TokenNotFound,
 }
 
 pub struct Store {
@@ -28,7 +34,7 @@ impl Store {
     pub async fn get_database(&self, id: Uuid) -> Result<DatabaseConfig, StoreError> {
         let row = sqlx::query!(
             r#"
-            SELECT id, user_id, name, backend_type, schema_name, connection_string, rules
+            SELECT id, name, backend_type, schema_name, connection_string, max_rows
             FROM postgate_databases
             WHERE id = $1
             "#,
@@ -48,23 +54,19 @@ impl Store {
             other => return Err(StoreError::InvalidBackendType(other.to_string())),
         };
 
-        let rules: QueryRules = serde_json::from_value(row.rules).unwrap_or_default();
-
         Ok(DatabaseConfig {
             id: row.id,
-            user_id: row.user_id,
             name: row.name,
             backend,
-            rules,
+            max_rows: row.max_rows,
         })
     }
 
     pub async fn create_database(
         &self,
-        user_id: Uuid,
         name: &str,
         backend: &DatabaseBackend,
-        rules: &QueryRules,
+        max_rows: i32,
     ) -> Result<DatabaseConfig, StoreError> {
         let (backend_type, schema_name, connection_string) = match backend {
             DatabaseBackend::Schema { schema_name } => ("schema", Some(schema_name.clone()), None),
@@ -73,20 +75,17 @@ impl Store {
             }
         };
 
-        let rules_json = serde_json::to_value(rules).unwrap_or_default();
-
         let row = sqlx::query!(
             r#"
-            INSERT INTO postgate_databases (user_id, name, backend_type, schema_name, connection_string, rules)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO postgate_databases (name, backend_type, schema_name, connection_string, max_rows)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             "#,
-            user_id,
             name,
             backend_type,
             schema_name,
             connection_string,
-            rules_json
+            max_rows
         )
         .fetch_one(&self.pool)
         .await?;
@@ -103,10 +102,9 @@ impl Store {
 
         Ok(DatabaseConfig {
             id: row.id,
-            user_id,
             name: name.to_string(),
             backend: backend.clone(),
-            rules: rules.clone(),
+            max_rows,
         })
     }
 
@@ -132,18 +130,13 @@ impl Store {
         Ok(())
     }
 
-    pub async fn list_databases_for_user(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<DatabaseConfig>, StoreError> {
+    pub async fn list_databases(&self) -> Result<Vec<DatabaseConfig>, StoreError> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, user_id, name, backend_type, schema_name, connection_string, rules
+            SELECT id, name, backend_type, schema_name, connection_string, max_rows
             FROM postgate_databases
-            WHERE user_id = $1
             ORDER BY created_at DESC
-            "#,
-            user_id
+            "#
         )
         .fetch_all(&self.pool)
         .await?;
@@ -160,47 +153,160 @@ impl Store {
                 _ => continue,
             };
 
-            let rules: QueryRules = serde_json::from_value(row.rules).unwrap_or_default();
-
             databases.push(DatabaseConfig {
                 id: row.id,
-                user_id: row.user_id,
                 name: row.name,
                 backend,
-                rules,
+                max_rows: row.max_rows,
             });
         }
 
         Ok(databases)
     }
+
+    // ============ Token Methods ============
+
+    /// Create a new token for a database
+    /// Returns (token_id, full_token) - the full token is only returned once!
+    pub async fn create_token(
+        &self,
+        database_id: Uuid,
+        name: &str,
+        permissions: &[TokenPermission],
+    ) -> Result<(Uuid, String), StoreError> {
+        let (full_token, token_hash, token_prefix) = generate_token();
+        let ops_vec: Vec<String> = permissions.iter().map(|p| p.as_str().to_string()).collect();
+
+        let token_id: Uuid = sqlx::query_scalar!(
+            r#"
+            INSERT INTO postgate_tokens (database_id, name, token_hash, token_prefix, allowed_operations)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            "#,
+            database_id,
+            name,
+            token_hash,
+            token_prefix,
+            &ops_vec
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((token_id, full_token))
+    }
+
+    /// Validate a token by its hash and return the associated database_id and allowed_operations
+    pub async fn validate_token(&self, token_hash: &str) -> Result<TokenInfo, StoreError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT t.id, t.database_id, t.allowed_operations
+            FROM postgate_tokens t
+            WHERE t.token_hash = $1
+            "#,
+            token_hash
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::TokenNotFound)?;
+
+        // Update last_used_at (fire and forget)
+        let pool = self.pool.clone();
+        let token_id = row.id;
+        tokio::spawn(async move {
+            let _ = sqlx::query!(
+                "UPDATE postgate_tokens SET last_used_at = NOW() WHERE id = $1",
+                token_id
+            )
+            .execute(&pool)
+            .await;
+        });
+
+        // Parse allowed_operations from text[] to HashSet<SqlOperation>
+        let allowed_operations: HashSet<SqlOperation> = row
+            .allowed_operations
+            .iter()
+            .filter_map(|op| match op.as_str() {
+                "SELECT" => Some(SqlOperation::Select),
+                "INSERT" => Some(SqlOperation::Insert),
+                "UPDATE" => Some(SqlOperation::Update),
+                "DELETE" => Some(SqlOperation::Delete),
+                "CREATE" => Some(SqlOperation::Create),
+                "ALTER" => Some(SqlOperation::Alter),
+                "DROP" => Some(SqlOperation::Drop),
+                _ => None,
+            })
+            .collect();
+
+        Ok(TokenInfo {
+            database_id: row.database_id,
+            token_id: row.id,
+            allowed_operations,
+        })
+    }
+
+    /// Delete a token by ID
+    pub async fn delete_token(&self, token_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query!("DELETE FROM postgate_tokens WHERE id = $1", token_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete all tokens for a database
+    pub async fn delete_tokens_for_database(&self, database_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query!(
+            "DELETE FROM postgate_tokens WHERE database_id = $1",
+            database_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List tokens for a database (without the actual token values)
+    pub async fn list_tokens(&self, database_id: Uuid) -> Result<Vec<TokenListItem>, StoreError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, name, token_prefix, created_at, last_used_at
+            FROM postgate_tokens
+            WHERE database_id = $1
+            ORDER BY created_at DESC
+            "#,
+            database_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TokenListItem {
+                id: r.id,
+                name: r.name,
+                token_prefix: r.token_prefix,
+                created_at: r.created_at,
+                last_used_at: r.last_used_at,
+            })
+            .collect())
+    }
 }
 
-pub fn generate_schema_name(user_id: Uuid, db_name: &str) -> String {
-    // Create a safe schema name: db_<short_user_id>_<sanitized_name>
-    let short_id = &user_id.to_string()[..8];
+/// Token info for listing (without the secret)
+#[derive(Debug, Clone)]
+pub struct TokenListItem {
+    pub id: Uuid,
+    pub name: String,
+    pub token_prefix: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub fn generate_schema_name(db_name: &str) -> String {
+    // Create a safe schema name: db_<uuid>_<sanitized_name>
+    let uuid_short = &Uuid::new_v4().to_string()[..8];
     let safe_name: String = db_name
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .take(50)
         .collect();
-    format!("db_{}_{}", short_id, safe_name.to_lowercase())
-}
-
-pub fn default_rules() -> QueryRules {
-    use crate::config::SqlOperation;
-
-    QueryRules {
-        allowed_operations: [
-            SqlOperation::Select,
-            SqlOperation::Insert,
-            SqlOperation::Update,
-            SqlOperation::Delete,
-        ]
-        .into_iter()
-        .collect(),
-        allowed_tables: None,
-        denied_tables: Default::default(),
-        max_rows: 1000,
-        timeout_seconds: 30,
-    }
+    format!("db_{}_{}", uuid_short, safe_name.to_lowercase())
 }

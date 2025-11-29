@@ -22,6 +22,12 @@ pub enum PostgateError {
 
     #[error("Invalid authorization header")]
     InvalidAuth,
+
+    #[error("Forbidden: admin access required")]
+    Forbidden,
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 #[derive(Serialize)]
@@ -51,6 +57,11 @@ impl ResponseError for PostgateError {
             PostgateError::MissingAuth | PostgateError::InvalidAuth => {
                 (actix_web::http::StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
             }
+            PostgateError::Forbidden => (actix_web::http::StatusCode::FORBIDDEN, "FORBIDDEN"),
+            PostgateError::Internal(_) => (
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+            ),
         };
 
         HttpResponse::build(status).json(ErrorResponse {

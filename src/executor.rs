@@ -64,12 +64,13 @@ impl ExecutorPool {
         request: &QueryRequest,
         max_rows: u32,
         timeout_seconds: u64,
+        is_ddl: bool,
     ) -> Result<QueryResponse, ExecutorError> {
         let timeout = Duration::from_secs(timeout_seconds);
 
         let result = tokio::time::timeout(
             timeout,
-            self.execute_query(database_id, backend, request, max_rows),
+            self.execute_query(database_id, backend, request, max_rows, is_ddl),
         )
         .await;
 
@@ -85,14 +86,15 @@ impl ExecutorPool {
         backend: &DatabaseBackend,
         request: &QueryRequest,
         max_rows: u32,
+        is_ddl: bool,
     ) -> Result<QueryResponse, ExecutorError> {
         match backend {
             DatabaseBackend::Schema { schema_name } => {
-                self.execute_with_schema(schema_name, request, max_rows)
+                self.execute_with_schema(schema_name, request, max_rows, is_ddl)
                     .await
             }
             DatabaseBackend::Dedicated { connection_string } => {
-                self.execute_dedicated(database_id, connection_string, request, max_rows)
+                self.execute_dedicated(database_id, connection_string, request, max_rows, is_ddl)
                     .await
             }
         }
@@ -103,6 +105,7 @@ impl ExecutorPool {
         schema_name: &str,
         request: &QueryRequest,
         max_rows: u32,
+        is_ddl: bool,
     ) -> Result<QueryResponse, ExecutorError> {
         // Use a transaction to set search_path, then execute the query
         let safe_schema = schema_name.replace('"', "\"\"");
@@ -118,6 +121,17 @@ impl ExecutorPool {
         let mut query = sqlx::query(&request.sql);
         for param in &request.params {
             query = bind_json_value(query, param);
+        }
+
+        // DDL statements don't return rows, use execute() instead of fetch_all()
+        if is_ddl {
+            let result = query.execute(&mut *tx).await?;
+            tx.commit().await?;
+
+            return Ok(QueryResponse {
+                rows: vec![],
+                row_count: result.rows_affected() as usize,
+            });
         }
 
         let rows: Vec<PgRow> = query.fetch_all(&mut *tx).await?;
@@ -141,6 +155,7 @@ impl ExecutorPool {
         connection_string: &str,
         request: &QueryRequest,
         max_rows: u32,
+        is_ddl: bool,
     ) -> Result<QueryResponse, ExecutorError> {
         let pool = self
             .get_or_create_dedicated_pool(database_id, connection_string)
@@ -149,6 +164,15 @@ impl ExecutorPool {
         let mut query = sqlx::query(&request.sql);
         for param in &request.params {
             query = bind_json_value(query, param);
+        }
+
+        // DDL statements don't return rows
+        if is_ddl {
+            let result = query.execute(pool.as_ref()).await?;
+            return Ok(QueryResponse {
+                rows: vec![],
+                row_count: result.rows_affected() as usize,
+            });
         }
 
         let rows: Vec<PgRow> = query.fetch_all(pool.as_ref()).await?;

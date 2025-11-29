@@ -1,4 +1,4 @@
-use crate::config::{QueryRules, SqlOperation};
+use crate::config::SqlOperation;
 use sqlparser::ast::{Statement, visit_relations};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -43,7 +43,12 @@ pub struct ParsedQuery {
     pub statement: Statement,
 }
 
-pub fn parse_and_validate(sql: &str, rules: &QueryRules) -> Result<ParsedQuery, ParseError> {
+/// Parse and validate SQL query
+/// - allowed_operations: comes from the token
+pub fn parse_and_validate(
+    sql: &str,
+    allowed_operations: &HashSet<SqlOperation>,
+) -> Result<ParsedQuery, ParseError> {
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql)?;
 
@@ -62,26 +67,9 @@ pub fn parse_and_validate(sql: &str, rules: &QueryRules) -> Result<ParsedQuery, 
     let table_refs = extract_table_refs(&statement);
     let tables = validate_table_refs(&table_refs)?;
 
-    // Validate operation
-    if !rules.allowed_operations.is_empty() && !rules.allowed_operations.contains(&operation) {
+    // Validate operation against token's allowed_operations
+    if !allowed_operations.is_empty() && !allowed_operations.contains(&operation) {
         return Err(ParseError::OperationNotAllowed(operation));
-    }
-
-    // Validate tables against rules
-    for table in &tables {
-        let table_lower = table.to_lowercase();
-
-        // Check denied tables
-        if rules.denied_tables.contains(&table_lower) {
-            return Err(ParseError::TableDenied(table.clone()));
-        }
-
-        // Check allowed tables (if whitelist is specified)
-        if let Some(allowed) = &rules.allowed_tables {
-            if !allowed.contains(&table_lower) {
-                return Err(ParseError::TableNotAllowed(table.clone()));
-            }
-        }
     }
 
     Ok(ParsedQuery {
@@ -97,6 +85,12 @@ fn extract_operation(statement: &Statement) -> Result<SqlOperation, ParseError> 
         Statement::Insert(_) => Ok(SqlOperation::Insert),
         Statement::Update { .. } => Ok(SqlOperation::Update),
         Statement::Delete(_) => Ok(SqlOperation::Delete),
+        // DDL operations - tenant can manage their own tables
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::CreateView { .. } => Ok(SqlOperation::Create),
+        Statement::AlterTable { .. } | Statement::AlterIndex { .. } => Ok(SqlOperation::Alter),
+        Statement::Drop { .. } | Statement::Truncate { .. } => Ok(SqlOperation::Drop),
         _ => Err(ParseError::UnsupportedStatement),
     }
 }
@@ -168,25 +162,19 @@ fn validate_table_refs(table_refs: &[TableRef]) -> Result<HashSet<String>, Parse
 mod tests {
     use super::*;
 
-    fn default_rules() -> QueryRules {
-        QueryRules {
-            allowed_operations: HashSet::from([
-                SqlOperation::Select,
-                SqlOperation::Insert,
-                SqlOperation::Update,
-                SqlOperation::Delete,
-            ]),
-            allowed_tables: None,
-            denied_tables: HashSet::new(),
-            max_rows: 1000,
-            timeout_seconds: 30,
-        }
+    fn all_operations() -> HashSet<SqlOperation> {
+        HashSet::from([
+            SqlOperation::Select,
+            SqlOperation::Insert,
+            SqlOperation::Update,
+            SqlOperation::Delete,
+        ])
     }
 
     #[test]
     fn test_parse_select() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM users WHERE id = $1", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM users WHERE id = $1", &ops);
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.operation, SqlOperation::Select);
@@ -195,8 +183,8 @@ mod tests {
 
     #[test]
     fn test_parse_insert() {
-        let rules = default_rules();
-        let result = parse_and_validate("INSERT INTO users (name, email) VALUES ($1, $2)", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("INSERT INTO users (name, email) VALUES ($1, $2)", &ops);
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.operation, SqlOperation::Insert);
@@ -204,80 +192,57 @@ mod tests {
 
     #[test]
     fn test_operation_not_allowed() {
-        let rules = QueryRules {
-            allowed_operations: HashSet::from([SqlOperation::Select]),
-            ..default_rules()
-        };
-        let result = parse_and_validate("DELETE FROM users WHERE id = $1", &rules);
+        let ops = HashSet::from([SqlOperation::Select]);
+        let result = parse_and_validate("DELETE FROM users WHERE id = $1", &ops);
         assert!(matches!(result, Err(ParseError::OperationNotAllowed(_))));
     }
 
     #[test]
-    fn test_table_denied() {
-        let rules = QueryRules {
-            denied_tables: HashSet::from(["secrets".to_string()]),
-            ..default_rules()
-        };
-        let result = parse_and_validate("SELECT * FROM secrets", &rules);
-        assert!(matches!(result, Err(ParseError::TableDenied(_))));
-    }
-
-    #[test]
-    fn test_table_not_in_whitelist() {
-        let rules = QueryRules {
-            allowed_tables: Some(HashSet::from(["users".to_string(), "posts".to_string()])),
-            ..default_rules()
-        };
-        let result = parse_and_validate("SELECT * FROM admin_logs", &rules);
-        assert!(matches!(result, Err(ParseError::TableNotAllowed(_))));
-    }
-
-    #[test]
     fn test_multiple_statements_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT 1; SELECT 2", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT 1; SELECT 2", &ops);
         assert!(matches!(result, Err(ParseError::MultipleStatements)));
     }
 
     #[test]
     fn test_qualified_table_name_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM public.users", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM public.users", &ops);
         assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
     }
 
     #[test]
     fn test_schema_qualified_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM other_schema.secrets", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM other_schema.secrets", &ops);
         assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
     }
 
     #[test]
     fn test_pg_catalog_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM pg_catalog.pg_tables", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM pg_catalog.pg_tables", &ops);
         assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
     }
 
     #[test]
     fn test_pg_tables_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM pg_tables", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM pg_tables", &ops);
         assert!(matches!(result, Err(ParseError::SystemTableAccess(_))));
     }
 
     #[test]
     fn test_pg_namespace_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM pg_namespace", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM pg_namespace", &ops);
         assert!(matches!(result, Err(ParseError::SystemTableAccess(_))));
     }
 
     #[test]
     fn test_information_schema_rejected() {
-        let rules = default_rules();
-        let result = parse_and_validate("SELECT * FROM information_schema.tables", &rules);
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM information_schema.tables", &ops);
         assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
     }
 }

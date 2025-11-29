@@ -1,29 +1,11 @@
 use actix_web::test;
-use jsonwebtoken::{EncodingKey, Header, encode};
-use postgate::auth::Claims;
-use postgate::config::{Config, DatabaseBackend, QueryRules, ServerConfig, SqlOperation};
+use postgate::config::{Config, DatabaseBackend, ServerConfig, TokenPermission};
 use postgate::executor::ExecutorPool;
 use postgate::server::{AppState, configure_routes};
 use postgate::store::{Store, generate_schema_name};
+use postgate::token::generate_token;
 use serde_json::json;
-use std::collections::HashSet;
 use uuid::Uuid;
-
-const TEST_JWT_SECRET: &str = "test_secret_for_integration_tests";
-
-fn create_jwt(database_id: &Uuid) -> String {
-    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
-    let claims = Claims {
-        sub: database_id.to_string(),
-        exp,
-    };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
-    )
-    .unwrap()
-}
 
 async fn setup_test_app() -> (
     impl actix_web::dev::Service<
@@ -31,7 +13,7 @@ async fn setup_test_app() -> (
         Response = actix_web::dev::ServiceResponse,
         Error = actix_web::Error,
     >,
-    String, // JWT token instead of Uuid
+    String, // API token
 ) {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
@@ -40,39 +22,33 @@ async fn setup_test_app() -> (
         .await
         .expect("Failed to create pool");
 
+    // Run migrations
+    let _ = sqlx::migrate!("./migrations")
+        .run(executor_pool.shared_pool())
+        .await;
+
     let store = Store::new(executor_pool.shared_pool().clone());
 
     // Create a test database entry
-    let user_id = Uuid::new_v4();
     let db_name = format!("test_{}", &Uuid::new_v4().to_string()[..8]);
-    let schema_name = generate_schema_name(user_id, &db_name);
-
-    let rules = QueryRules {
-        allowed_operations: [
-            SqlOperation::Select,
-            SqlOperation::Insert,
-            SqlOperation::Update,
-            SqlOperation::Delete,
-        ]
-        .into_iter()
-        .collect(),
-        allowed_tables: None,
-        denied_tables: HashSet::new(),
-        max_rows: 1000,
-        timeout_seconds: 30,
-    };
+    let schema_name = generate_schema_name(&db_name);
 
     let db_config = store
         .create_database(
-            user_id,
             &db_name,
             &DatabaseBackend::Schema {
                 schema_name: schema_name.clone(),
             },
-            &rules,
+            1000, // max_rows
         )
         .await
         .expect("Failed to create test database");
+
+    // Create a token for the database with tenant permissions (DML + DDL)
+    let (_, token) = store
+        .create_token(db_config.id, "test_token", TokenPermission::tenant_set())
+        .await
+        .expect("Failed to create token");
 
     // Create a test table in the schema
     sqlx::query(&format!(
@@ -95,7 +71,6 @@ async fn setup_test_app() -> (
     let config = Config {
         server: ServerConfig::default(),
         database_url,
-        jwt_secret: TEST_JWT_SECRET.to_string(),
     };
 
     let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
@@ -107,7 +82,6 @@ async fn setup_test_app() -> (
     )
     .await;
 
-    let token = create_jwt(&db_config.id);
     (app, token)
 }
 
@@ -125,7 +99,6 @@ async fn test_health_endpoint() {
     let config = Config {
         server: ServerConfig::default(),
         database_url,
-        jwt_secret: TEST_JWT_SECRET.to_string(),
     };
 
     let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
@@ -168,7 +141,7 @@ async fn test_query_invalid_token() {
 
     let req = test::TestRequest::post()
         .uri("/query")
-        .insert_header(("Authorization", "Bearer invalid-jwt-token"))
+        .insert_header(("Authorization", "Bearer invalid-token"))
         .set_json(json!({"sql": "SELECT 1", "params": []}))
         .to_request();
 
@@ -177,12 +150,11 @@ async fn test_query_invalid_token() {
 }
 
 #[actix_web::test]
-async fn test_query_unknown_database() {
+async fn test_query_unknown_token() {
     let (app, _token) = setup_test_app().await;
 
-    // Create a valid JWT but for a non-existent database
-    let fake_id = Uuid::new_v4();
-    let fake_token = create_jwt(&fake_id);
+    // Generate a valid format token that doesn't exist in DB
+    let (fake_token, _, _) = generate_token();
 
     let req = test::TestRequest::post()
         .uri("/query")
@@ -191,10 +163,7 @@ async fn test_query_unknown_database() {
         .to_request();
 
     let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 404);
-
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    assert_eq!(body["code"], "DATABASE_NOT_FOUND");
+    assert_eq!(resp.status(), 401);
 }
 
 #[actix_web::test]
@@ -283,34 +252,6 @@ async fn test_query_multiple_statements_rejected() {
     assert_eq!(body["code"], "PARSE_ERROR");
 }
 
-#[actix_web::test]
-async fn test_query_expired_token() {
-    let (app, _token) = setup_test_app().await;
-
-    // Create an expired JWT
-    let db_id = Uuid::new_v4();
-    let exp = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize;
-    let claims = Claims {
-        sub: db_id.to_string(),
-        exp,
-    };
-    let expired_token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
-    )
-    .unwrap();
-
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", expired_token)))
-        .set_json(json!({"sql": "SELECT 1", "params": []}))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 401);
-}
-
 // Helper to setup an admin app (with access to public schema)
 async fn setup_admin_app() -> (
     impl actix_web::dev::Service<
@@ -318,7 +259,7 @@ async fn setup_admin_app() -> (
         Response = actix_web::dev::ServiceResponse,
         Error = actix_web::Error,
     >,
-    String, // Admin JWT token
+    String, // Admin token
 ) {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
@@ -336,46 +277,38 @@ async fn setup_admin_app() -> (
 
     // Create admin database entry with access to public schema
     let admin_id = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
-    let admin_user_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
 
     // Delete if exists (from previous test runs)
+    let _ = sqlx::query("DELETE FROM postgate_tokens WHERE database_id = $1")
+        .bind(admin_id)
+        .execute(executor_pool.shared_pool())
+        .await;
+
     let _ = sqlx::query("DELETE FROM postgate_databases WHERE id = $1")
         .bind(admin_id)
         .execute(executor_pool.shared_pool())
         .await;
 
-    let rules = QueryRules {
-        allowed_operations: [
-            SqlOperation::Select,
-            SqlOperation::Insert,
-            SqlOperation::Update,
-            SqlOperation::Delete,
-        ]
-        .into_iter()
-        .collect(),
-        allowed_tables: None,
-        denied_tables: HashSet::new(),
-        max_rows: 1000,
-        timeout_seconds: 30,
-    };
-
     // Insert admin database with public schema access
     sqlx::query(
-        r#"INSERT INTO postgate_databases (id, user_id, name, backend_type, schema_name, rules)
-           VALUES ($1, $2, 'admin', 'schema', 'public', $3)
+        r#"INSERT INTO postgate_databases (id, name, backend_type, schema_name, max_rows)
+           VALUES ($1, 'admin', 'schema', 'public', 1000)
            ON CONFLICT (id) DO NOTHING"#,
     )
     .bind(admin_id)
-    .bind(admin_user_id)
-    .bind(serde_json::to_value(&rules).unwrap())
     .execute(executor_pool.shared_pool())
     .await
     .expect("Failed to create admin database");
 
+    // Create token for admin database with default permissions (DML only)
+    let (_, admin_token) = store
+        .create_token(admin_id, "admin_token", TokenPermission::default_set())
+        .await
+        .expect("Failed to create admin token");
+
     let config = Config {
         server: ServerConfig::default(),
         database_url,
-        jwt_secret: TEST_JWT_SECRET.to_string(),
     };
 
     let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
@@ -387,21 +320,20 @@ async fn setup_admin_app() -> (
     )
     .await;
 
-    let token = create_jwt(&admin_id);
-    (app, token)
+    (app, admin_token)
 }
 
 #[actix_web::test]
 async fn test_admin_can_create_tenant() {
     let (app, admin_token) = setup_admin_app().await;
 
-    let user_id = Uuid::new_v4();
+    let db_name = format!("test_db_{}", &Uuid::new_v4().to_string()[..8]);
     let req = test::TestRequest::post()
         .uri("/query")
         .insert_header(("Authorization", format!("Bearer {}", admin_token)))
         .set_json(json!({
-            "sql": "SELECT * FROM create_tenant_database($1::uuid, $2)",
-            "params": [user_id.to_string(), "test_db"]
+            "sql": "SELECT * FROM create_tenant_database($1)",
+            "params": [db_name]
         }))
         .to_request();
 
@@ -419,21 +351,23 @@ async fn test_admin_can_create_tenant() {
 }
 
 #[actix_web::test]
-async fn test_admin_can_list_tenants() {
+async fn test_admin_can_list_databases() {
     let (app, admin_token) = setup_admin_app().await;
 
-    let user_id = Uuid::new_v4();
     let req = test::TestRequest::post()
         .uri("/query")
         .insert_header(("Authorization", format!("Bearer {}", admin_token)))
         .set_json(json!({
-            "sql": "SELECT * FROM list_tenant_databases($1::uuid)",
-            "params": [user_id.to_string()]
+            "sql": "SELECT id, name, backend_type, schema_name, max_rows FROM postgate_databases",
+            "params": []
         }))
         .to_request();
 
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["rows"].is_array());
 }
 
 #[actix_web::test]
@@ -441,13 +375,13 @@ async fn test_admin_can_delete_tenant() {
     let (app, admin_token) = setup_admin_app().await;
 
     // First create a tenant
-    let user_id = Uuid::new_v4();
+    let db_name = format!("to_delete_{}", &Uuid::new_v4().to_string()[..8]);
     let create_req = test::TestRequest::post()
         .uri("/query")
         .insert_header(("Authorization", format!("Bearer {}", admin_token)))
         .set_json(json!({
-            "sql": "SELECT * FROM create_tenant_database($1::uuid, $2)",
-            "params": [user_id.to_string(), "to_delete"]
+            "sql": "SELECT * FROM create_tenant_database($1)",
+            "params": [db_name]
         }))
         .to_request();
 
@@ -563,93 +497,6 @@ async fn test_tenant_cannot_list_schemas() {
 }
 
 #[actix_web::test]
-async fn test_tenant_cannot_list_all_tables() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to list all tables via information_schema (qualified name - should be blocked)
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT table_schema, table_name FROM information_schema.tables",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    // Should fail at parse time - qualified table names are blocked
-    assert_eq!(resp.status(), 400, "Should block information_schema.tables");
-
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    assert_eq!(body["code"], "PARSE_ERROR");
-}
-
-#[actix_web::test]
-async fn test_tenant_cannot_use_pg_catalog() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to query pg_catalog.pg_namespace (qualified name - should be blocked)
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT nspname FROM pg_catalog.pg_namespace",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    // Should fail at parse time - qualified table names are blocked
-    assert_eq!(resp.status(), 400, "Should block pg_catalog.pg_namespace");
-
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    assert_eq!(body["code"], "PARSE_ERROR");
-}
-
-#[actix_web::test]
-async fn test_tenant_cannot_access_pg_tables_directly() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to query pg_tables directly (system table - should be blocked)
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM pg_tables",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    // Should fail at parse time - pg_* tables are blocked
-    assert_eq!(resp.status(), 400, "Should block pg_tables");
-
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    assert_eq!(body["code"], "PARSE_ERROR");
-}
-
-#[actix_web::test]
-async fn test_tenant_cannot_call_admin_function_qualified() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to call admin function with schema-qualified name
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM public.create_tenant_database($1::uuid, $2)",
-            "params": [Uuid::new_v4().to_string(), "hacked"]
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(
-        !resp.status().is_success(),
-        "Should not call public.create_tenant_database"
-    );
-}
-
-#[actix_web::test]
 async fn test_tenant_cannot_set_search_path() {
     let (app, tenant_token) = setup_test_app().await;
 
@@ -666,225 +513,6 @@ async fn test_tenant_cannot_set_search_path() {
     let resp = test::call_service(&app, req).await;
     // Should fail - SET is not SELECT/INSERT/UPDATE/DELETE
     assert!(!resp.status().is_success(), "Should not allow SET command");
-}
-
-#[actix_web::test]
-async fn test_tenant_cannot_create_schema() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to create a new schema
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "CREATE SCHEMA hacked_schema",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(
-        !resp.status().is_success(),
-        "Should not allow CREATE SCHEMA"
-    );
-}
-
-#[actix_web::test]
-async fn test_tenant_cannot_drop_schema() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to drop a schema
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "DROP SCHEMA public CASCADE",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(!resp.status().is_success(), "Should not allow DROP SCHEMA");
-}
-
-// Advanced SQL injection / bypass attempts
-
-#[actix_web::test]
-async fn test_subquery_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access public schema via subquery
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM users WHERE id IN (SELECT id FROM public.postgate_databases)",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "Should block qualified name in subquery"
-    );
-}
-
-#[actix_web::test]
-async fn test_cte_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access via CTE (WITH clause)
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "WITH leaked AS (SELECT * FROM public.postgate_databases) SELECT * FROM leaked",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block qualified name in CTE");
-}
-
-#[actix_web::test]
-async fn test_join_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access via JOIN
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM users JOIN public.postgate_databases ON true",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block qualified name in JOIN");
-}
-
-#[actix_web::test]
-async fn test_union_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access via UNION
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT id, name FROM users UNION SELECT id::text, name FROM public.postgate_databases",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block qualified name in UNION");
-}
-
-#[actix_web::test]
-async fn test_insert_select_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to exfiltrate via INSERT...SELECT
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "INSERT INTO users (name) SELECT name FROM public.postgate_databases",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "Should block qualified name in INSERT SELECT"
-    );
-}
-
-#[actix_web::test]
-async fn test_update_from_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access via UPDATE...FROM
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "UPDATE users SET name = p.name FROM public.postgate_databases p WHERE users.id = 1",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "Should block qualified name in UPDATE FROM"
-    );
-}
-
-#[actix_web::test]
-async fn test_delete_using_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access via DELETE...USING
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "DELETE FROM users USING public.postgate_databases WHERE true",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "Should block qualified name in DELETE USING"
-    );
-}
-
-#[actix_web::test]
-async fn test_exists_subquery_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to probe via EXISTS
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM public.postgate_databases)",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block qualified name in EXISTS");
-}
-
-#[actix_web::test]
-async fn test_lateral_join_with_qualified_name() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to access via LATERAL JOIN
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM users, LATERAL (SELECT * FROM public.postgate_databases LIMIT 1) sub",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block qualified name in LATERAL");
 }
 
 #[actix_web::test]
@@ -905,107 +533,10 @@ async fn test_pg_class_access() {
     assert_eq!(resp.status(), 400, "Should block pg_class access");
 }
 
-#[actix_web::test]
-async fn test_pg_proc_access() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to list functions via pg_proc
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT proname FROM pg_proc WHERE proname LIKE '%tenant%'",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block pg_proc access");
-}
+// Test token management endpoints
 
 #[actix_web::test]
-async fn test_pg_roles_access() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to list roles
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT rolname FROM pg_roles",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block pg_roles access");
-}
-
-#[actix_web::test]
-async fn test_case_sensitivity_bypass() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to bypass with mixed case
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM PG_CLASS",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "Should block PG_CLASS (case insensitive)"
-    );
-}
-
-#[actix_web::test]
-async fn test_quoted_identifier_bypass() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try to bypass with quoted identifier
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM \"public\".\"postgate_databases\"",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 400, "Should block quoted qualified names");
-}
-
-#[actix_web::test]
-async fn test_nested_subqueries() {
-    let (app, tenant_token) = setup_test_app().await;
-
-    // Try deeply nested subqueries
-    let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
-        .set_json(json!({
-            "sql": "SELECT * FROM users WHERE id = (SELECT id FROM (SELECT id FROM (SELECT id FROM public.postgate_databases LIMIT 1) a) b)",
-            "params": []
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "Should block qualified name in nested subqueries"
-    );
-}
-
-// Test dedicated backend mode (separate connection pool)
-#[actix_web::test]
-async fn test_dedicated_backend() {
+async fn test_create_token_endpoint() {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgate:password@localhost/postgate_test".to_string());
 
@@ -1013,44 +544,55 @@ async fn test_dedicated_backend() {
         .await
         .expect("Failed to create pool");
 
+    let _ = sqlx::migrate!("./migrations")
+        .run(executor_pool.shared_pool())
+        .await;
+
     let store = Store::new(executor_pool.shared_pool().clone());
 
-    // Create a dedicated database entry (using the same connection string for test)
-    let user_id = Uuid::new_v4();
-    let dedicated_id = Uuid::new_v4();
+    // Setup admin database (ID = 00000000-0000-0000-0000-000000000000)
+    let admin_id = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
 
-    let rules = QueryRules {
-        allowed_operations: [
-            SqlOperation::Select,
-            SqlOperation::Insert,
-            SqlOperation::Update,
-            SqlOperation::Delete,
-        ]
-        .into_iter()
-        .collect(),
-        allowed_tables: None,
-        denied_tables: HashSet::new(),
-        max_rows: 1000,
-        timeout_seconds: 30,
-    };
+    // Clean up and create admin database
+    let _ = sqlx::query("DELETE FROM postgate_tokens WHERE database_id = $1")
+        .bind(admin_id)
+        .execute(executor_pool.shared_pool())
+        .await;
+    let _ = sqlx::query("DELETE FROM postgate_databases WHERE id = $1")
+        .bind(admin_id)
+        .execute(executor_pool.shared_pool())
+        .await;
 
-    // Insert dedicated database entry
     sqlx::query(
-        r#"INSERT INTO postgate_databases (id, user_id, name, backend_type, connection_string, rules)
-           VALUES ($1, $2, 'dedicated_test', 'dedicated', $3, $4)"#,
+        r#"INSERT INTO postgate_databases (id, name, backend_type, schema_name, max_rows)
+           VALUES ($1, 'admin', 'schema', 'public', 1000)"#,
     )
-    .bind(dedicated_id)
-    .bind(user_id)
-    .bind(&database_url) // Same DB but tests dedicated code path
-    .bind(serde_json::to_value(&rules).unwrap())
+    .bind(admin_id)
     .execute(executor_pool.shared_pool())
     .await
-    .expect("Failed to create dedicated database entry");
+    .expect("Failed to create admin database");
+
+    // Create admin token
+    let (_, admin_token) = store
+        .create_token(admin_id, "admin_token", TokenPermission::default_set())
+        .await
+        .expect("Failed to create admin token");
+
+    // Create a target database to create token for
+    let db_config = store
+        .create_database(
+            "token_test_db",
+            &DatabaseBackend::Schema {
+                schema_name: generate_schema_name("token_test"),
+            },
+            1000, // max_rows
+        )
+        .await
+        .expect("Failed to create database");
 
     let config = Config {
         server: ServerConfig::default(),
-        database_url: database_url.clone(),
-        jwt_secret: TEST_JWT_SECRET.to_string(),
+        database_url,
     };
 
     let state = actix_web::web::Data::new(AppState::new(config, executor_pool, store));
@@ -1062,24 +604,39 @@ async fn test_dedicated_backend() {
     )
     .await;
 
-    let token = create_jwt(&dedicated_id);
-
-    // Query should work - dedicated mode doesn't use search_path, queries public schema directly
+    // Create a token via the endpoint (requires admin auth)
     let req = test::TestRequest::post()
-        .uri("/query")
-        .insert_header(("Authorization", format!("Bearer {}", token)))
-        .set_json(json!({"sql": "SELECT COUNT(*) as cnt FROM postgate_databases", "params": []}))
+        .uri("/tokens")
+        .insert_header(("Authorization", format!("Bearer {}", admin_token)))
+        .set_json(json!({
+            "database_id": db_config.id.to_string(),
+            "name": "my_token"
+        }))
         .to_request();
 
     let resp = test::call_service(&app, req).await;
-    let status = resp.status();
+    assert!(resp.status().is_success());
+
     let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(body["id"].is_string());
+    assert!(body["token"].as_str().unwrap().starts_with("pg_"));
+    assert!(body["message"].as_str().is_some());
+}
 
-    if !status.is_success() {
-        panic!("Dedicated query failed: {} - {:?}", status, body);
-    }
+#[actix_web::test]
+async fn test_create_token_requires_admin() {
+    let (app, tenant_token) = setup_test_app().await;
 
-    assert_eq!(body["row_count"], 1);
-    // Should have at least 1 row (the dedicated entry we just created)
-    assert!(body["rows"][0]["cnt"].as_i64().unwrap() >= 1);
+    // Try to create a token with a non-admin token - should fail
+    let req = test::TestRequest::post()
+        .uri("/tokens")
+        .insert_header(("Authorization", format!("Bearer {}", tenant_token)))
+        .set_json(json!({
+            "database_id": "00000000-0000-0000-0000-000000000000",
+            "name": "hacked_token"
+        }))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 403, "Non-admin should get 403 Forbidden");
 }

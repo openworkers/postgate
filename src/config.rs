@@ -5,7 +5,6 @@ use std::collections::HashSet;
 pub struct Config {
     pub server: ServerConfig,
     pub database_url: String,
-    pub jwt_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,32 +32,18 @@ pub enum DatabaseBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub id: uuid::Uuid,
-    pub user_id: uuid::Uuid,
     pub name: String,
     pub backend: DatabaseBackend,
-    pub rules: QueryRules,
+    pub max_rows: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Rules used for parsing/validating queries
+/// allowed_operations comes from token, tables rules are system-level
+#[derive(Debug, Clone, Default)]
 pub struct QueryRules {
-    #[serde(default)]
     pub allowed_operations: HashSet<SqlOperation>,
-    #[serde(default)]
     pub allowed_tables: Option<HashSet<String>>,
-    #[serde(default)]
     pub denied_tables: HashSet<String>,
-    #[serde(default = "default_row_limit")]
-    pub max_rows: u32,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
-}
-
-fn default_row_limit() -> u32 {
-    1000
-}
-
-fn default_timeout() -> u64 {
-    30
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,6 +53,9 @@ pub enum SqlOperation {
     Insert,
     Update,
     Delete,
+    Create,
+    Alter,
+    Drop,
 }
 
 impl SqlOperation {
@@ -77,11 +65,80 @@ impl SqlOperation {
             SqlOperation::Insert => "INSERT",
             SqlOperation::Update => "UPDATE",
             SqlOperation::Delete => "DELETE",
+            SqlOperation::Create => "CREATE",
+            SqlOperation::Alter => "ALTER",
+            SqlOperation::Drop => "DROP",
         }
+    }
+
+    /// Returns true for DDL operations (CREATE, ALTER, DROP)
+    /// DDL statements don't return rows and need special handling
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            SqlOperation::Create | SqlOperation::Alter | SqlOperation::Drop
+        )
     }
 }
 
 impl std::fmt::Display for SqlOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Token permission matching SQL operations
+/// Maps directly to database allowed_operations array
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TokenPermission {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Create,
+    Alter,
+    Drop,
+}
+
+impl TokenPermission {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenPermission::Select => "SELECT",
+            TokenPermission::Insert => "INSERT",
+            TokenPermission::Update => "UPDATE",
+            TokenPermission::Delete => "DELETE",
+            TokenPermission::Create => "CREATE",
+            TokenPermission::Alter => "ALTER",
+            TokenPermission::Drop => "DROP",
+        }
+    }
+
+    /// Default permissions (DML only)
+    pub fn default_set() -> &'static [TokenPermission] {
+        &[
+            TokenPermission::Select,
+            TokenPermission::Insert,
+            TokenPermission::Update,
+            TokenPermission::Delete,
+        ]
+    }
+
+    /// Tenant permissions (DML + DDL)
+    pub fn tenant_set() -> &'static [TokenPermission] {
+        &[
+            TokenPermission::Select,
+            TokenPermission::Insert,
+            TokenPermission::Update,
+            TokenPermission::Delete,
+            TokenPermission::Create,
+            TokenPermission::Alter,
+            TokenPermission::Drop,
+        ]
+    }
+}
+
+impl std::fmt::Display for TokenPermission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
