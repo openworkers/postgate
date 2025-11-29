@@ -22,6 +22,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a new tenant database
+    CreateDb {
+        /// Database name
+        name: String,
+
+        /// Maximum rows per query
+        #[arg(short, long, default_value = "1000")]
+        max_rows: i32,
+
+        /// Use dedicated connection string instead of schema isolation
+        #[arg(short, long)]
+        dedicated: Option<String>,
+    },
+
     /// Generate a token for a database
     GenToken {
         /// Database UUID
@@ -51,6 +65,51 @@ fn load_config() -> Config {
         server: ServerConfig { host, port },
         database_url,
     }
+}
+
+async fn create_db_command(
+    name: &str,
+    max_rows: i32,
+    dedicated: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
+
+    let pool = sqlx::PgPool::connect(&database_url).await?;
+
+    match dedicated {
+        Some(connection_string) => {
+            // Dedicated database
+            let row: (Uuid,) = sqlx::query_as(
+                r#"
+                INSERT INTO postgate_databases (name, backend_type, connection_string, max_rows)
+                VALUES ($1, 'dedicated', $2, $3)
+                RETURNING id
+                "#,
+            )
+            .bind(name)
+            .bind(connection_string)
+            .bind(max_rows)
+            .fetch_one(&pool)
+            .await?;
+
+            println!("{}", row.0);
+        }
+        None => {
+            // Schema-based isolation (default)
+            let row: (Uuid, String) =
+                sqlx::query_as("SELECT id, schema_name FROM create_tenant_database($1, $2)")
+                    .bind(name)
+                    .bind(max_rows)
+                    .fetch_one(&pool)
+                    .await?;
+
+            println!("{}", row.0);
+            eprintln!("Schema: {}", row.1);
+        }
+    }
+
+    Ok(())
 }
 
 async fn generate_token_command(
@@ -118,6 +177,17 @@ async fn main() -> std::io::Result<()> {
     // Handle subcommands
     if let Some(command) = cli.command {
         match command {
+            Commands::CreateDb {
+                name,
+                max_rows,
+                dedicated,
+            } => {
+                if let Err(e) = create_db_command(&name, max_rows, dedicated.as_deref()).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             Commands::GenToken {
                 database_id,
                 name,

@@ -354,6 +354,9 @@ $$ LANGUAGE plpgsql;
 -- Schema: public (access to postgate_* tables and functions)
 --
 -- Create admin token after setup:
+--   postgate gen-token 00000000-0000-0000-0000-000000000000 admin
+--
+-- Or via SQL:
 --   SELECT * FROM create_tenant_token(
 --       '00000000-0000-0000-0000-000000000000'::uuid,
 --       'admin',
@@ -368,22 +371,4 @@ VALUES (
     'schema',
     'public',
     1000
-);
-
--- ----------------------------------------------------------------------------
--- OpenWorkers Database (UUID: 00000000-0000-0000-0000-000000000001)
--- ----------------------------------------------------------------------------
--- Purpose: Dedicated connection to OpenWorkers API database
--- Type: Dedicated (external connection string)
---
--- Note: Update the connection string for your environment!
---
-
-INSERT INTO postgate_databases (id, name, backend_type, connection_string, max_rows)
-VALUES (
-    '00000000-0000-0000-0000-000000000001',
-    'openworkers',
-    'dedicated',
-    'postgres://openworkers:password@localhost/openworkers',
-    10000
 );

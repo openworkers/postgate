@@ -17,7 +17,7 @@ Postgate provides a secure HTTP interface to PostgreSQL with:
                                 Token: pg_xxx...
 ┌─────────────────┐                                  ┌──────────────┐
 │  Admin Client   │ ────── POST /query ────────────▶ │              │
-│  (openworkers)  │   SELECT create_tenant_token()   │   postgate   │
+│                 │   SELECT create_tenant_token()   │   postgate   │
 └─────────────────┘                                  │              │
                                                      │   ┌──────┐   │      ┌────────────────┐
                                 Token: pg_xxx...     │   │ SQL  │   │      │   PostgreSQL   │
@@ -63,13 +63,8 @@ Use the CLI to generate tokens for the seed databases:
 ```bash
 # Generate token for postgate admin (manages tenants)
 DATABASE_URL="postgres://postgate:your-password@localhost/postgate" \
-  cargo run -- gen-token 00000000-0000-0000-0000-000000000000 postgate-admin
+  cargo run -- gen-token 00000000-0000-0000-0000-000000000000 admin
 # Output: pg_abc123... (SAVE THIS!)
-
-# Generate token for openworkers (dedicated database)
-DATABASE_URL="postgres://postgate:your-password@localhost/postgate" \
-  cargo run -- gen-token 00000000-0000-0000-0000-000000000001 openworkers
-# Output: pg_def456... (SAVE THIS!)
 ```
 
 Or via SQL directly:
@@ -115,29 +110,44 @@ curl -X POST http://localhost:3000/query \
 # Start the server (default)
 cargo run
 
+# Create a tenant database (schema-based)
+cargo run -- create-db <NAME> [-m <MAX_ROWS>]
+
+# Create a dedicated database (external connection)
+cargo run -- create-db <NAME> -d <CONNECTION_STRING>
+
 # Generate a token for a database
 cargo run -- gen-token <DATABASE_ID> [NAME] [-p <PERMISSIONS>]
 
 # Show help
 cargo run -- --help
+cargo run -- create-db --help
 cargo run -- gen-token --help
 ```
 
 **Examples:**
 
 ```bash
-# Default DML permissions (SELECT, INSERT, UPDATE, DELETE)
-cargo run -- gen-token 00000000-0000-0000-0000-000000000000
+# Create a tenant database with schema isolation
+cargo run -- create-db my-app
+# Output: <database-uuid>
+# Schema: tenant_xxx_my_app
 
-# Named token with default permissions
-cargo run -- gen-token 00000000-0000-0000-0000-000000000000 admin
+# Create with custom max rows
+cargo run -- create-db my-app -m 5000
 
-# Full permissions (DML + DDL)
-cargo run -- gen-token 00000000-0000-0000-0000-000000000000 admin \
+# Create a dedicated database (external PostgreSQL)
+cargo run -- create-db premium-client -d "postgres://user:pass@host/db"
+
+# Generate token with default DML permissions
+cargo run -- gen-token <database-uuid> default
+
+# Generate token with full permissions (DML + DDL)
+cargo run -- gen-token <database-uuid> admin \
     -p SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,DROP
 
-# Read-only token
-cargo run -- gen-token 00000000-0000-0000-0000-000000000000 readonly -p SELECT
+# Generate read-only token
+cargo run -- gen-token <database-uuid> readonly -p SELECT
 ```
 
 ## API Reference
@@ -383,12 +393,11 @@ WHERE database_id = 'your-database-id'::uuid;
 
 ## Seed Data
 
-The migration creates two default databases:
+The migration creates a default admin database:
 
 | ID | Name | Backend | Purpose |
 |----|------|---------|---------|
 | `00000000-0000-0000-0000-000000000000` | postgate_admin | schema (public) | Admin operations |
-| `00000000-0000-0000-0000-000000000001` | openworkers | dedicated | OpenWorkers API |
 
 ## Client Integration
 
