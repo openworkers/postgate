@@ -1,8 +1,7 @@
 use actix_web::{App, HttpServer, web};
 use clap::{Parser, Subcommand};
+use log::info;
 use std::env;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use postgate::config::{Config, ServerConfig};
@@ -58,8 +57,21 @@ fn load_config() -> Config {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let host = std::env::var("POSTGRES_HOST").expect("POSTGRES_HOST must be set");
+            let port = std::env::var("POSTGRES_PORT").expect("POSTGRES_PORT must be set");
+            let user = std::env::var("POSTGRES_USER").expect("POSTGRES_USER must be set");
+            let password =
+                std::env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD must be set");
+            let database = std::env::var("POSTGRES_DB").expect("POSTGRES_DB must be set");
+
+            log::debug!("DATABASE_URL not set, using POSTGRES_* env vars");
+
+            format!("postgres://{user}:{password}@{host}:{port}/{database}")
+        }
+    };
 
     Config {
         server: ServerConfig { host, port },
@@ -71,11 +83,9 @@ async fn create_db_command(
     name: &str,
     max_rows: i32,
     dedicated: Option<&str>,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
-
-    let pool = sqlx::PgPool::connect(&database_url).await?;
+    let pool = sqlx::PgPool::connect(&config.database_url).await?;
 
     match dedicated {
         Some(connection_string) => {
@@ -116,11 +126,9 @@ async fn generate_token_command(
     database_id: &str,
     name: &str,
     permissions_str: &str,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
-
-    let pool = sqlx::PgPool::connect(&database_url).await?;
+    let pool = sqlx::PgPool::connect(&config.database_url).await?;
 
     // Parse database_id
     let db_id: Uuid = database_id
@@ -171,8 +179,13 @@ async fn generate_token_command(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
+    env_logger::init();
+
+    log::debug!("start main");
 
     let cli = Cli::parse();
+
+    let config = load_config();
 
     // Handle subcommands
     if let Some(command) = cli.command {
@@ -182,7 +195,9 @@ async fn main() -> std::io::Result<()> {
                 max_rows,
                 dedicated,
             } => {
-                if let Err(e) = create_db_command(&name, max_rows, dedicated.as_deref()).await {
+                if let Err(e) =
+                    create_db_command(&name, max_rows, dedicated.as_deref(), &config).await
+                {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
@@ -193,7 +208,9 @@ async fn main() -> std::io::Result<()> {
                 name,
                 permissions,
             } => {
-                if let Err(e) = generate_token_command(&database_id, &name, &permissions).await {
+                if let Err(e) =
+                    generate_token_command(&database_id, &name, &permissions, &config).await
+                {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
@@ -203,13 +220,6 @@ async fn main() -> std::io::Result<()> {
     }
 
     // Start server
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("postgate=info".parse().unwrap()),
-        )
-        .init();
-
-    let config = load_config();
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
 
     info!("Starting postgate server on {}", bind_addr);

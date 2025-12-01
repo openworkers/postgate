@@ -3,7 +3,6 @@
 //! Tokens are formatted as: pg_<random_32_bytes_hex>
 //! The hash is SHA-256 of the full token string
 
-use rand::Rng;
 use sha2::{Digest, Sha256};
 
 /// Token prefix for identification
@@ -12,8 +11,7 @@ pub const TOKEN_PREFIX: &str = "pg_";
 /// Generate a new random token
 /// Returns (full_token, token_hash, token_prefix)
 pub fn generate_token() -> (String, String, String) {
-    let mut rng = rand::thread_rng();
-    let random_bytes: [u8; 32] = rng.r#gen();
+    let random_bytes: [u8; 32] = rand::random();
     let random_hex = hex::encode(random_bytes);
 
     let full_token = format!("{}{}", TOKEN_PREFIX, random_hex);

@@ -106,7 +106,14 @@ fn extract_table_refs(statement: &Statement) -> Vec<TableRef> {
     let mut tables = Vec::new();
 
     let _ = visit_relations(statement, |relation| {
-        let parts: Vec<_> = relation.0.iter().map(|i| i.value.clone()).collect();
+        let parts: Vec<_> = relation
+            .0
+            .iter()
+            .filter_map(|i| match i {
+                sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+                _ => None,
+            })
+            .collect();
 
         let table_ref = match parts.len() {
             1 => TableRef {

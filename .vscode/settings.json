@@ -2,8 +2,12 @@
   "cSpell.words": [
     "actix",
     "chrono",
+    "dotenv",
+    "dotenvy",
     "openworkers",
     "postgate",
+    "serde",
+    "sqlparser",
     "sqlx",
     "thiserror"
   ]

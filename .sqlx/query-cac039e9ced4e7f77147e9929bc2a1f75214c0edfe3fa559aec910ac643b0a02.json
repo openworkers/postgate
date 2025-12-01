@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO postgate_databases (user_id, name, backend_type, schema_name, connection_string, rules)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            RETURNING id\n            ",
+  "query": "\n            INSERT INTO postgate_databases (name, backend_type, schema_name, connection_string, max_rows)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id\n            ",
   "describe": {
     "columns": [
       {
@@ -11,17 +11,16 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
         "Varchar",
         "Varchar",
         "Varchar",
         "Text",
-        "Jsonb"
+        "Int4"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "f83a6f42b125e01f1a1c1a87c69c2ebf1c16af1f38b634ccd70d24d11876ae27"
+  "hash": "cac039e9ced4e7f77147e9929bc2a1f75214c0edfe3fa559aec910ac643b0a02"
 }
