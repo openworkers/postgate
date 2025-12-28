@@ -1,5 +1,3 @@
-use actix_web::{HttpResponse, ResponseError};
-use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -27,42 +25,51 @@ pub enum PostgateError {
     Internal(String),
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-    code: &'static str,
-}
+#[cfg(feature = "server")]
+mod server_impl {
+    use super::*;
+    use actix_web::{HttpResponse, ResponseError};
+    use serde::Serialize;
 
-impl ResponseError for PostgateError {
-    fn error_response(&self) -> HttpResponse {
-        let (status, code) = match self {
-            PostgateError::Parse(_) => (actix_web::http::StatusCode::BAD_REQUEST, "PARSE_ERROR"),
-            PostgateError::Executor(ExecutorError::Timeout) => {
-                (actix_web::http::StatusCode::GATEWAY_TIMEOUT, "TIMEOUT")
-            }
-            PostgateError::Executor(ExecutorError::RowLimitExceeded(_)) => (
-                actix_web::http::StatusCode::BAD_REQUEST,
-                "ROW_LIMIT_EXCEEDED",
-            ),
-            PostgateError::Executor(_) => (
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "DATABASE_ERROR",
-            ),
-            PostgateError::DatabaseNotFound(_) => {
-                (actix_web::http::StatusCode::NOT_FOUND, "DATABASE_NOT_FOUND")
-            }
-            PostgateError::MissingAuth | PostgateError::InvalidAuth => {
-                (actix_web::http::StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
-            }
-            PostgateError::Internal(_) => (
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-            ),
-        };
+    #[derive(Serialize)]
+    struct ErrorResponse {
+        error: String,
+        code: &'static str,
+    }
 
-        HttpResponse::build(status).json(ErrorResponse {
-            error: self.to_string(),
-            code,
-        })
+    impl ResponseError for PostgateError {
+        fn error_response(&self) -> HttpResponse {
+            let (status, code) = match self {
+                PostgateError::Parse(_) => {
+                    (actix_web::http::StatusCode::BAD_REQUEST, "PARSE_ERROR")
+                }
+                PostgateError::Executor(ExecutorError::Timeout) => {
+                    (actix_web::http::StatusCode::GATEWAY_TIMEOUT, "TIMEOUT")
+                }
+                PostgateError::Executor(ExecutorError::RowLimitExceeded(_)) => (
+                    actix_web::http::StatusCode::BAD_REQUEST,
+                    "ROW_LIMIT_EXCEEDED",
+                ),
+                PostgateError::Executor(_) => (
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "DATABASE_ERROR",
+                ),
+                PostgateError::DatabaseNotFound(_) => {
+                    (actix_web::http::StatusCode::NOT_FOUND, "DATABASE_NOT_FOUND")
+                }
+                PostgateError::MissingAuth | PostgateError::InvalidAuth => {
+                    (actix_web::http::StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
+                }
+                PostgateError::Internal(_) => (
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                ),
+            };
+
+            HttpResponse::build(status).json(ErrorResponse {
+                error: self.to_string(),
+                code,
+            })
+        }
     }
 }

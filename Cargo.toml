@@ -9,10 +9,14 @@ repository = "https://github.com/openworkers/postgate"
 keywords = ["postgresql", "proxy", "http", "sql", "serverless"]
 categories = ["database", "web-programming"]
 
+[features]
+default = ["server"]
+server = ["dep:actix-web", "dep:actix-rt", "dep:clap", "dep:dotenvy", "dep:env_logger"]
+
 [dependencies]
-# Web server
-actix-web = "4"
-actix-rt = "2"
+# Web server (optional - only for server feature)
+actix-web = { version = "4", optional = true }
+actix-rt = { version = "2", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -41,13 +45,18 @@ hex = "0.4"
 
 # Logging
 log = "0.4.28"
-env_logger = "0.11.8"
+env_logger = { version = "0.11.8", optional = true }
 
-# Config
-dotenvy = "0.15"
+# Config (optional - only for server feature)
+dotenvy = { version = "0.15", optional = true }
 
-# CLI
-clap = { version = "4", features = ["derive"] }
+# CLI (optional - only for server feature)
+clap = { version = "4", features = ["derive"], optional = true }
+
+[[bin]]
+name = "postgate"
+path = "src/main.rs"
+required-features = ["server"]
 
 [dev-dependencies]
 actix-http = "3"

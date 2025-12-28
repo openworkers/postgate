@@ -41,6 +41,7 @@ pub struct ParsedQuery {
     pub operation: SqlOperation,
     pub tables: HashSet<String>,
     pub statement: Statement,
+    pub returns_rows: bool,
 }
 
 /// Parse and validate SQL query
@@ -72,10 +73,13 @@ pub fn parse_and_validate(
         return Err(ParseError::OperationNotAllowed(operation));
     }
 
+    let returns_rows = check_returns_rows(&statement);
+
     Ok(ParsedQuery {
         operation,
         tables,
         statement,
+        returns_rows,
     })
 }
 
@@ -92,6 +96,17 @@ fn extract_operation(statement: &Statement) -> Result<SqlOperation, ParseError> 
         Statement::AlterTable { .. } | Statement::AlterIndex { .. } => Ok(SqlOperation::Alter),
         Statement::Drop { .. } | Statement::Truncate { .. } => Ok(SqlOperation::Drop),
         _ => Err(ParseError::UnsupportedStatement),
+    }
+}
+
+/// Check if the statement returns rows (SELECT or DML with RETURNING)
+fn check_returns_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(_) => true,
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update { returning, .. } => returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
     }
 }
 
