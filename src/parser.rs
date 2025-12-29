@@ -87,7 +87,7 @@ fn extract_operation(statement: &Statement) -> Result<SqlOperation, ParseError> 
     match statement {
         Statement::Query(_) => Ok(SqlOperation::Select),
         Statement::Insert(_) => Ok(SqlOperation::Insert),
-        Statement::Update { .. } => Ok(SqlOperation::Update),
+        Statement::Update(_) => Ok(SqlOperation::Update),
         Statement::Delete(_) => Ok(SqlOperation::Delete),
         // DDL operations - tenant can manage their own tables
         Statement::CreateTable { .. }
@@ -104,7 +104,7 @@ fn check_returns_rows(statement: &Statement) -> bool {
     match statement {
         Statement::Query(_) => true,
         Statement::Insert(insert) => insert.returning.is_some(),
-        Statement::Update { returning, .. } => returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
         Statement::Delete(delete) => delete.returning.is_some(),
         _ => false,
     }
