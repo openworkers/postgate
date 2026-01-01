@@ -1,6 +1,6 @@
 [package]
 name = "postgate"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 default-run = "postgate"
 description = "Secure HTTP proxy for PostgreSQL with SQL validation and multi-tenant support"
@@ -10,8 +10,9 @@ keywords = ["postgresql", "proxy", "http", "sql", "serverless"]
 categories = ["database", "web-programming"]
 
 [features]
-default = ["server"]
+default = ["server", "migrations"]
 server = ["dep:actix-web", "dep:actix-rt", "dep:clap", "dep:dotenvy", "dep:env_logger"]
+migrations = []
 
 [dependencies]
 # Web server (optional - only for server feature)
@@ -51,7 +52,7 @@ env_logger = { version = "0.11.8", optional = true }
 dotenvy = { version = "0.15", optional = true }
 
 # CLI (optional - only for server feature)
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 
 [[bin]]
 name = "postgate"

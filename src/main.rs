@@ -15,6 +15,11 @@ use postgate::token::generate_token;
 #[command(name = "postgate")]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Skip database migrations (useful when using OpenWorkers schema)
+    #[cfg(feature = "migrations")]
+    #[arg(long, env = "POSTGATE_SKIP_MIGRATIONS")]
+    skip_migrations: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -229,13 +234,21 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to create executor pool");
 
-    // Run migrations
-    info!("Running database migrations...");
-    sqlx::migrate!("./migrations")
-        .run(executor_pool.shared_pool())
-        .await
-        .expect("Failed to run migrations");
-    info!("Migrations completed");
+    // Run migrations (unless skipped or feature disabled)
+    #[cfg(feature = "migrations")]
+    if cli.skip_migrations {
+        info!("Skipping database migrations (--skip-migrations or POSTGATE_SKIP_MIGRATIONS=true)");
+    } else {
+        info!("Running database migrations...");
+        sqlx::migrate!("./migrations")
+            .run(executor_pool.shared_pool())
+            .await
+            .expect("Failed to run migrations");
+        info!("Migrations completed");
+    }
+
+    #[cfg(not(feature = "migrations"))]
+    info!("Migrations disabled (compiled without 'migrations' feature)");
 
     // Create store (uses the shared pool)
     let store = Store::new(executor_pool.shared_pool().clone());
