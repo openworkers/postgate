@@ -156,16 +156,18 @@ async fn generate_token_command(
         }
     }
 
-    // Insert into database
+    // Delete existing token with same name (if any), then insert new one
+    // Note: Using DELETE + INSERT instead of ON CONFLICT for view compatibility
+    sqlx::query("DELETE FROM postgate_tokens WHERE database_id = $1 AND name = $2")
+        .bind(db_id)
+        .bind(name)
+        .execute(&pool)
+        .await?;
+
     sqlx::query(
         r#"
         INSERT INTO postgate_tokens (database_id, name, token_hash, token_prefix, allowed_operations)
         VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (database_id, name) DO UPDATE SET
-            token_hash = EXCLUDED.token_hash,
-            token_prefix = EXCLUDED.token_prefix,
-            allowed_operations = EXCLUDED.allowed_operations,
-            created_at = NOW()
         "#,
     )
     .bind(db_id)
