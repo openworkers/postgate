@@ -270,6 +270,31 @@ SELECT * FROM public.users
 
 -- ❌ Blocked: System table access
 SELECT * FROM pg_tables
+
+-- ✅ Allowed: postgate_helpers functions
+SELECT * FROM postgate_helpers.list_tables()
+```
+
+## Helper Functions
+
+The `postgate_helpers` schema provides utility functions accessible to all tenants:
+
+### postgate_helpers.list_tables()
+
+List all tables in the current tenant's schema with row counts.
+
+```sql
+SELECT * FROM postgate_helpers.list_tables();
+-- Returns: { table_name: "users", row_count: 42 }, ...
+```
+
+### postgate_helpers.describe_table(name)
+
+Describe columns of a table in the current tenant's schema.
+
+```sql
+SELECT * FROM postgate_helpers.describe_table('users');
+-- Returns: { column_name, data_type, is_nullable, column_default, is_primary_key }
 ```
 
 ## Multi-Tenant Isolation

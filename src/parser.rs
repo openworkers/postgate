@@ -157,9 +157,12 @@ fn validate_table_refs(table_refs: &[TableRef]) -> Result<HashSet<String>, Parse
 
     for table_ref in table_refs {
         // Block qualified names (schema.table)
+        // Exception: postgate_helpers contains utility functions (list_tables, describe_table)
         if let Some(schema) = &table_ref.schema {
-            let full_name = format!("{}.{}", schema, table_ref.name);
-            return Err(ParseError::QualifiedTableName(full_name));
+            if schema != "postgate_helpers" {
+                let full_name = format!("{}.{}", schema, table_ref.name);
+                return Err(ParseError::QualifiedTableName(full_name));
+            }
         }
 
         let name_lower = table_ref.name.to_lowercase();
@@ -266,5 +269,12 @@ mod tests {
         let ops = all_operations();
         let result = parse_and_validate("SELECT * FROM information_schema.tables", &ops);
         assert!(matches!(result, Err(ParseError::QualifiedTableName(_))));
+    }
+
+    #[test]
+    fn test_postgate_helpers_allowed() {
+        let ops = all_operations();
+        let result = parse_and_validate("SELECT * FROM postgate_helpers.list_tables()", &ops);
+        assert!(result.is_ok());
     }
 }
