@@ -11,6 +11,7 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub max_body_size_mb: usize,
 }
 
 impl Default for ServerConfig {
@@ -18,6 +19,7 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 3000,
+            max_body_size_mb: 10,
         }
     }
 }

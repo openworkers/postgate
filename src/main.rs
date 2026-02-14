@@ -61,6 +61,10 @@ fn load_config() -> Config {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
+    let max_body_size_mb = env::var("MAX_BODY_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
 
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
@@ -79,7 +83,11 @@ fn load_config() -> Config {
     };
 
     Config {
-        server: ServerConfig { host, port },
+        server: ServerConfig {
+            host,
+            port,
+            max_body_size_mb,
+        },
         database_url,
     }
 }
@@ -255,11 +263,16 @@ async fn main() -> std::io::Result<()> {
     // Create store (uses the shared pool)
     let store = Store::new(executor_pool.shared_pool().clone());
 
-    let state = web::Data::new(AppState::new(config, executor_pool, store));
+    let state = web::Data::new(AppState::new(config.clone(), executor_pool, store));
+
+    // Configure JSON payload size limit
+    let json_config = web::JsonConfig::default()
+        .limit(config.server.max_body_size_mb * 1024 * 1024);
 
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .app_data(json_config.clone())
             .configure(configure_routes)
     })
     .bind(&bind_addr)?

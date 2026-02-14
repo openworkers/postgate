@@ -1,6 +1,6 @@
 [package]
 name = "postgate"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 default-run = "postgate"
 description = "Secure HTTP proxy for PostgreSQL with SQL validation and multi-tenant support"
