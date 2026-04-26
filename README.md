@@ -163,10 +163,17 @@ Execute a SQL query against a tenant database.
 **Request Body:**
 ```json
 {
-  "sql": "SELECT * FROM users WHERE id = $1",
+  "sql": "SELECT * FROM users WHERE id = $1::int",
   "params": [1]
 }
 ```
+
+**Recommended: always cast parameters explicitly** (`$1::int`, `$2::text`, `$3::uuid`, etc.).
+Postgate routes cast parameters through Postgres' text parser, which is both safer (no
+ambiguity about column type) and more reliable (it sidesteps a sqlx prepared-statement
+type-cache issue that can produce intermittent `invalid byte sequence for encoding UTF8`
+errors on numeric params). Uncast parameters still work but rely on Postgres' implicit
+type inference from context.
 
 **Response (success):**
 ```json

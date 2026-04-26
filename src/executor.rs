@@ -406,3 +406,75 @@ fn get_column_value(row: &PgRow, idx: usize, type_info: &PgTypeInfo) -> JsonValu
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cast_present_simple() {
+        assert!(has_explicit_cast("WHERE id = $1::int", 1));
+        assert!(has_explicit_cast("WHERE id = $1::text", 1));
+        assert!(has_explicit_cast("WHERE id = $1::uuid", 1));
+        assert!(has_explicit_cast("WHERE id = $1::int[]", 1));
+    }
+
+    #[test]
+    fn cast_absent() {
+        assert!(!has_explicit_cast("WHERE id = $1", 1));
+        assert!(!has_explicit_cast("WHERE id = $1 AND x = $2", 1));
+        assert!(!has_explicit_cast("VALUES ($1, $2)", 2));
+    }
+
+    #[test]
+    fn cast_idx_mismatch() {
+        // Cast on $1 doesn't count for $2
+        assert!(!has_explicit_cast("VALUES ($1::int, $2)", 2));
+        assert!(has_explicit_cast("VALUES ($1::int, $2)", 1));
+    }
+
+    #[test]
+    fn does_not_match_within_larger_index() {
+        // $1 should not match inside $11
+        assert!(!has_explicit_cast("WHERE id = $11::int", 1));
+        assert!(has_explicit_cast("WHERE id = $11::int", 11));
+    }
+
+    #[test]
+    fn whitespace_between_param_and_cast() {
+        assert!(has_explicit_cast("WHERE id = $1 ::int", 1));
+        assert!(has_explicit_cast("WHERE id = $1\t::int", 1));
+        assert!(has_explicit_cast("WHERE id = $1\n::int", 1));
+    }
+
+    #[test]
+    fn multiple_occurrences_one_cast_is_enough() {
+        // $1 used twice: once without cast, once with — should be considered "cast"
+        assert!(has_explicit_cast(
+            "WHERE id = $1 OR backup_id = $1::int",
+            1
+        ));
+    }
+
+    #[test]
+    fn cast_followed_by_more_params() {
+        let sql = "UPDATE t SET a = $1::int, b = $2::real, c = $3::text WHERE id = $4::text";
+        assert!(has_explicit_cast(sql, 1));
+        assert!(has_explicit_cast(sql, 2));
+        assert!(has_explicit_cast(sql, 3));
+        assert!(has_explicit_cast(sql, 4));
+    }
+
+    #[test]
+    fn no_match_for_param_not_in_sql() {
+        assert!(!has_explicit_cast("WHERE id = $1::int", 2));
+        assert!(!has_explicit_cast("VALUES ($1, $2, $3)", 4));
+    }
+
+    #[test]
+    fn double_digit_param_index() {
+        let sql = "INSERT INTO t (a, b, c, d, e, f, g, h, i, j) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::int)";
+        assert!(has_explicit_cast(sql, 10));
+        assert!(!has_explicit_cast(sql, 1));
+    }
+}
