@@ -119,8 +119,8 @@ impl ExecutorPool {
 
         // Execute the user query
         let mut query = sqlx::query(&request.sql);
-        for param in &request.params {
-            query = bind_json_value(query, param);
+        for (i, param) in request.params.iter().enumerate() {
+            query = bind_json_value(query, param, &request.sql, i + 1);
         }
 
         // DDL statements don't return rows, use execute() instead of fetch_all()
@@ -162,8 +162,8 @@ impl ExecutorPool {
             .await?;
 
         let mut query = sqlx::query(&request.sql);
-        for param in &request.params {
-            query = bind_json_value(query, param);
+        for (i, param) in request.params.iter().enumerate() {
+            query = bind_json_value(query, param, &request.sql, i + 1);
         }
 
         // DDL statements don't return rows
@@ -223,15 +223,59 @@ impl ExecutorPool {
     }
 }
 
+/// Returns true if `$param_idx` appears in the SQL with an explicit cast (`::type`).
+/// Skips occurrences where the next char is a digit (so `$1` doesn't match inside `$11`).
+/// String/comment-aware analysis would be more robust but a false positive only means we
+/// bind a number as text instead of binary, which Postgres still rejects with a clear
+/// type error rather than silently corrupting data.
+fn has_explicit_cast(sql: &str, param_idx: usize) -> bool {
+    let needle = format!("${}", param_idx);
+    let bytes = sql.as_bytes();
+    let mut start = 0;
+
+    while let Some(pos) = sql[start..].find(&needle) {
+        let abs = start + pos;
+        let after = abs + needle.len();
+
+        if bytes.get(after).is_some_and(|c| c.is_ascii_digit()) {
+            start = after;
+            continue;
+        }
+
+        let mut idx = after;
+        while bytes.get(idx).is_some_and(|b| b.is_ascii_whitespace()) {
+            idx += 1;
+        }
+
+        if sql[idx..].starts_with("::") {
+            return true;
+        }
+
+        start = abs + 1;
+    }
+
+    false
+}
+
 fn bind_json_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     value: &'q JsonValue,
+    sql: &str,
+    param_idx: usize,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match value {
         JsonValue::Null => query.bind(None::<String>),
         JsonValue::Bool(b) => query.bind(*b),
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            // When the SQL has an explicit cast (e.g. $N::int), bind as text and let
+            // Postgres parse via the cast. Binding numeric JSON as i64/f64 sends 8-byte
+            // big-endian binary on the wire, which combined with sqlx's prepared-statement
+            // type cache can intermittently be re-decoded as UTF-8 by Postgres, producing
+            // "invalid byte sequence for encoding UTF8: 0x00" (the high zero bytes of
+            // small ints). Routing through the SQL cast keeps the wire pure ASCII.
+            if has_explicit_cast(sql, param_idx) {
+                query.bind(n.to_string())
+            } else if let Some(i) = n.as_i64() {
                 query.bind(i)
             } else if let Some(f) = n.as_f64() {
                 query.bind(f)

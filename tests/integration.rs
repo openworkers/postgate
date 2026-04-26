@@ -628,3 +628,75 @@ async fn test_delete_token_via_sql() {
     let body: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(body["rows"][0]["delete_tenant_token"], true);
 }
+
+// Regression test for intermittent "invalid byte sequence for encoding UTF8: 0x00"
+// triggered when binding numeric JSON params to INT4/REAL columns with explicit casts.
+// Without the fix, sqlx encodes JSON numbers as i64/f64 (8-byte big-endian binary).
+// The high zero bytes of small ints occasionally get re-decoded as UTF-8 by Postgres,
+// producing the 0x00 byte error on the param's portal. We loop many iterations with
+// values that have leading zero bytes in big-endian (small ints, zero, null) to maximize
+// the chance of hitting the bug.
+#[actix_web::test]
+async fn test_numeric_params_with_explicit_casts() {
+    let (app, token) = setup_test_app().await;
+
+    // Create a table with the same shape as a real-world failing case
+    let create_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", token)))
+        .set_json(json!({
+            "sql": "CREATE TABLE numerics (id text PRIMARY KEY, val_int int, val_real real, val_int_nullable int, val_real_nullable real)",
+            "params": []
+        }))
+        .to_request();
+    let resp = test::call_service(&app, create_req).await;
+    assert!(resp.status().is_success(), "CREATE TABLE failed");
+
+    // Seed one row
+    let insert_req = test::TestRequest::post()
+        .uri("/query")
+        .insert_header(("Authorization", format!("Bearer {}", token)))
+        .set_json(json!({
+            "sql": "INSERT INTO numerics (id, val_int, val_real) VALUES ($1::text, $2::int, $3::real)",
+            "params": ["row1", 0, 0.0]
+        }))
+        .to_request();
+    let resp = test::call_service(&app, insert_req).await;
+    assert!(resp.status().is_success(), "Initial INSERT failed");
+
+    // Many UPDATEs with mixed numeric params (small ints, zeros, nulls) — these are the
+    // values whose binary encoding contains leading 0x00 bytes that trigger the driver bug.
+    let mut errors: Vec<String> = Vec::new();
+    let test_values: Vec<(serde_json::Value, serde_json::Value, serde_json::Value, serde_json::Value)> = vec![
+        (json!(72), json!(9.5), json!(null), json!(null)),
+        (json!(0), json!(0.0), json!(0), json!(0.0)),
+        (json!(1), json!(0.1), json!(null), json!(null)),
+        (json!(500), json!(12.34), json!(72), json!(9.5)),
+        (json!(null), json!(null), json!(null), json!(null)),
+    ];
+
+    for iter in 0..50 {
+        let (vi, vr, vin, vrn) = &test_values[iter % test_values.len()];
+        let req = test::TestRequest::post()
+            .uri("/query")
+            .insert_header(("Authorization", format!("Bearer {}", token)))
+            .set_json(json!({
+                "sql": "UPDATE numerics SET val_int = $1::int, val_real = $2::real, val_int_nullable = $3::int, val_real_nullable = $4::real WHERE id = $5::text",
+                "params": [vi, vr, vin, vrn, "row1"]
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            errors.push(format!("iter {} status {}: {}", iter, status, body));
+        }
+    }
+
+    assert!(
+        errors.is_empty(),
+        "{} of 50 numeric UPDATEs failed:\n{}",
+        errors.len(),
+        errors.join("\n")
+    );
+}
