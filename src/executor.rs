@@ -228,7 +228,10 @@ impl ExecutorPool {
 /// String/comment-aware analysis would be more robust but a false positive only means we
 /// bind a number as text instead of binary, which Postgres still rejects with a clear
 /// type error rather than silently corrupting data.
-fn has_explicit_cast(sql: &str, param_idx: usize) -> bool {
+///
+/// Exposed for downstream crates (e.g. openworkers-runner) that have their own
+/// param-binding code path and need the same workaround for the sqlx UTF-8 0x00 bug.
+pub fn has_explicit_cast(sql: &str, param_idx: usize) -> bool {
     let needle = format!("${}", param_idx);
     let bytes = sql.as_bytes();
     let mut start = 0;
